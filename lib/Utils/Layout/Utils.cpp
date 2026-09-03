@@ -469,6 +469,183 @@ presburger::IntegerRelation getTricyclicLayoutRelation(
   return result;
 }
 
+FailureOr<presburger::IntegerRelation> getMultiTileLayoutRelation(
+    RankedTensorType tensorType, int64_t rowAxis, int64_t columnAxis,
+    int64_t tileRows, int64_t tileColumns, int64_t tilesPerCiphertext,
+    int64_t numSlots) {
+  int64_t rank = tensorType.getRank();
+
+  // MTP requires two distinct logical axes for the primitive tile.
+  if (rank < 2 || rowAxis < 0 || rowAxis >= rank || columnAxis < 0 ||
+      columnAxis >= rank || rowAxis == columnAxis) {
+    return failure();
+  }
+
+  // This initial implementation supports only statically shaped, nonempty
+  // tensors and positive compile-time packing parameters.
+  if (!tensorType.hasStaticShape() || tileRows <= 0 || tileColumns <= 0 ||
+      tilesPerCiphertext <= 0 || numSlots <= 0) {
+    return failure();
+  }
+
+  for (int64_t dim : tensorType.getShape()) {
+    if (dim <= 0) return failure();
+  }
+
+  // Check the slot capacity without overflowing signed int64_t.
+  //
+  // requiredSlots =
+  //     tileRows * tileColumns * tilesPerCiphertext
+  if (tileRows > numSlots / tileColumns) return failure();
+  int64_t slotsPerTile = tileRows * tileColumns;
+
+  if (tilesPerCiphertext > numSlots / slotsPerTile) return failure();
+  int64_t requiredSlots = tilesPerCiphertext * slotsPerTile;
+
+  // Construct the shape of the tensor of primitive tiles. Untiled dimensions
+  // keep their original extent. The two selected dimensions are replaced by
+  // their numbers of primitive tiles.
+  SmallVector<int64_t> tileTensorShape(tensorType.getShape());
+
+  auto ceilDivPositive = [](int64_t value, int64_t divisor) {
+    return 1 + (value - 1) / divisor;
+  };
+
+  tileTensorShape[rowAxis] =
+      ceilDivPositive(tensorType.getDimSize(rowAxis), tileRows);
+  tileTensorShape[columnAxis] =
+      ceilDivPositive(tensorType.getDimSize(columnAxis), tileColumns);
+
+  // Count tile-tensor entries while rejecting integer overflow.
+  int64_t totalTiles = 1;
+  for (int64_t extent : tileTensorShape) {
+    if (totalTiles > std::numeric_limits<int64_t>::max() / extent) {
+      return failure();
+    }
+    totalTiles *= extent;
+  }
+
+  int64_t numCiphertexts =
+      ceilDivPositive(totalTiles, tilesPerCiphertext);
+
+  // Layout relations map all logical tensor coordinates to exactly two
+  // physical coordinates: [ct, slot].
+  IntegerRelation result(PresburgerSpace::getRelationSpace(
+      rank, /*numRange=*/2, /*numSymbol=*/0, /*numLocals=*/0));
+
+  // Bound every logical tensor coordinate.
+  for (int64_t axis = 0; axis < rank; ++axis) {
+    addBounds(result, axis, 0, tensorType.getDimSize(axis) - 1);
+  }
+
+  int64_t rangeOffset = result.getVarKindOffset(VarKind::Range);
+  int64_t ctVar = rangeOffset;
+  int64_t slotVar = rangeOffset + 1;
+
+  addBounds(result, ctVar, 0, numCiphertexts - 1);
+  addBounds(result, slotVar, 0, requiredSlots - 1);
+
+  // Add quotient variables for the two tiled logical dimensions:
+  //
+  //   qL = floor(row / tileRows)
+  //   qD = floor(column / tileColumns)
+  SmallVector<int64_t> rowCoeffs(result.getNumCols(), 0);
+  rowCoeffs[rowAxis] = 1;
+  result.addLocalFloorDiv(rowCoeffs, tileRows);
+  int64_t qLVar = result.getVarKindEnd(VarKind::Local) - 1;
+
+  SmallVector<int64_t> columnCoeffs(result.getNumCols(), 0);
+  columnCoeffs[columnAxis] = 1;
+  result.addLocalFloorDiv(columnCoeffs, tileColumns);
+  int64_t qDVar = result.getVarKindEnd(VarKind::Local) - 1;
+
+  // Construct the row-major flattened index of the tile-tensor entry.
+  //
+  // Untiled dimensions use their original logical coordinate. The selected
+  // row and column dimensions use qL and qD instead.
+  SmallVector<std::pair<int64_t, int64_t>> tileIdTerms;
+  int64_t tileTensorStride = 1;
+
+  for (int64_t axis = rank - 1; axis >= 0; --axis) {
+    int64_t coordinateVar = axis;
+    if (axis == rowAxis) {
+      coordinateVar = qLVar;
+    } else if (axis == columnAxis) {
+      coordinateVar = qDVar;
+    }
+
+    tileIdTerms.push_back({coordinateVar, tileTensorStride});
+    tileTensorStride *= tileTensorShape[axis];
+  }
+
+  // Materialize:
+  //
+  //   ct = floor(tileId / tilesPerCiphertext)
+  //
+  // addLocalFloorDiv expects a coefficient vector describing tileId.
+  SmallVector<int64_t> tileIdCoeffs(result.getNumCols(), 0);
+  for (auto [position, coefficient] : tileIdTerms) {
+    tileIdCoeffs[position] = coefficient;
+  }
+
+  result.addLocalFloorDiv(tileIdCoeffs, tilesPerCiphertext);
+  int64_t tileGroupVar = result.getVarKindEnd(VarKind::Local) - 1;
+
+  // Equate the floor-division result with the physical ciphertext index.
+  addConstraint(result, {{ctVar, 1}, {tileGroupVar, -1}},
+                /*equality=*/true);
+
+  // Add p and enforce:
+  //
+  //   tileId = tilesPerCiphertext * ct + p
+  //
+  // Since ct is floor(tileId / tilesPerCiphertext), p is the tile position
+  // within the selected ciphertext.
+  int64_t pVar = result.appendVar(VarKind::Local);
+
+  SmallVector<std::pair<int64_t, int64_t>> tilePositionEquality(
+      tileIdTerms);
+  tilePositionEquality.push_back({tileGroupVar, -tilesPerCiphertext});
+  tilePositionEquality.push_back({pVar, -1});
+  addConstraint(result, tilePositionEquality, /*equality=*/true);
+  addBounds(result, pVar, 0, tilesPerCiphertext - 1);
+
+  // Add the intra-tile row coordinate:
+  //
+  //   row = tileRows * qL + l
+  int64_t lVar = result.appendVar(VarKind::Local);
+  addConstraint(result,
+                {{rowAxis, 1}, {qLVar, -tileRows}, {lVar, -1}},
+                /*equality=*/true);
+  addBounds(result, lVar, 0, tileRows - 1);
+
+  // Add the intra-tile column coordinate:
+  //
+  //   column = tileColumns * qD + d
+  int64_t dVar = result.appendVar(VarKind::Local);
+  addConstraint(
+      result,
+      {{columnAxis, 1}, {qDVar, -tileColumns}, {dVar, -1}},
+      /*equality=*/true);
+  addBounds(result, dVar, 0, tileColumns - 1);
+
+  // Apply the intra-ciphertext MTP embedding:
+  //
+  //   slot =
+  //       d * (tilesPerCiphertext * tileRows)
+  //     + p * tileRows
+  //     + l
+  int64_t columnStride = tilesPerCiphertext * tileRows;
+  addConstraint(result,
+                {{slotVar, 1},
+                 {dVar, -columnStride},
+                 {pVar, -tileRows},
+                 {lVar, -1}},
+                /*equality=*/true);
+
+  return result;
+}
+
 presburger::IntegerRelation getPeriodicReplicationRelation(
     int64_t numCiphertexts, int64_t numSlots, int64_t period) {
   assert(numCiphertexts == 1 && "only support single ciphertext layout");
@@ -666,6 +843,19 @@ bool isRelationTricyclic(RankedTensorType tensorType, int64_t numSlots,
   IntegerRelation tricyclicRelation =
       getTricyclicLayoutRelation(tensorType, numSlots);
   return isRelationEqual(relation, tricyclicRelation);
+}
+
+bool isRelationMultiTile(
+    RankedTensorType tensorType, int64_t rowAxis, int64_t columnAxis,
+    int64_t tileRows, int64_t tileColumns, int64_t tilesPerCiphertext,
+    int64_t numSlots, const presburger::IntegerRelation& relation) {
+  auto expected = getMultiTileLayoutRelation(
+      tensorType, rowAxis, columnAxis, tileRows, tileColumns,
+      tilesPerCiphertext, numSlots);
+
+  if (failed(expected)) return false;
+
+  return isRelationEqual(expected.value(), relation);
 }
 
 presburger::IntegerRelation collapseDimensions(

@@ -80,6 +80,31 @@ presburger::IntegerRelation getBicyclicLayoutRelation(
 presburger::IntegerRelation getTricyclicLayoutRelation(
     RankedTensorType tensorType, int64_t numSlots);
 
+// Returns an IntegerRelation representing a Multi-Tile Packing (MTP) layout.
+//
+// The logical tensor is decomposed into primitive 2-D tiles along rowAxis and
+// columnAxis. All remaining tensor dimensions remain outer dimensions of the
+// tile tensor. Tile-tensor entries are enumerated in row-major order and
+// grouped consecutively, with tilesPerCiphertext primitive tiles assigned to
+// each ciphertext.
+//
+// For tile position p and intra-tile coordinates (l, d), the physical slot
+// embedding is:
+//
+//   slot = d * (tilesPerCiphertext * tileRows) + p * tileRows + l
+//
+// The returned relation maps the original logical tensor coordinates to
+// [ct, slot]. Conceptually multidimensional ciphertext coordinates are
+// flattened into ct in row-major order.
+//
+// Returns failure if the tensor rank or axis selection is invalid, tile
+// parameters are non-positive, or one ciphertext does not have enough slots
+// for tilesPerCiphertext tiles.
+FailureOr<presburger::IntegerRelation> getMultiTileLayoutRelation(
+    RankedTensorType tensorType, int64_t rowAxis, int64_t columnAxis,
+    int64_t tileRows, int64_t tileColumns, int64_t tilesPerCiphertext,
+    int64_t numSlots);
+
 // Returns the generalized diagonal packing relation for the cleartext
 // operand of a bicyclic matrix multiplication.
 //
@@ -145,6 +170,13 @@ bool isRelationBicyclic(RankedTensorType matrixType, int64_t numSlots,
 // tensor type and ciphertext semantic shape.
 bool isRelationTricyclic(RankedTensorType tensorType, int64_t numSlots,
                          const presburger::IntegerRelation& relation);
+
+// Returns true if relation is the row-major-assignment MTP layout produced by
+// getMultiTileLayoutRelation for the supplied tensor and packing parameters.
+bool isRelationMultiTile(
+    RankedTensorType tensorType, int64_t rowAxis, int64_t columnAxis,
+    int64_t tileRows, int64_t tileColumns, int64_t tilesPerCiphertext,
+    int64_t numSlots, const presburger::IntegerRelation& relation);
 
 // Returns a new IntegerRelation that is the same as the given relation, but
 // with the given dimensions collapsed. This expects that the reassociation

@@ -240,6 +240,351 @@ TEST(UtilsTest, BicyclicLayout3x5Repeated) {
   EXPECT_EQ(packedMatrix, expected);
 }
 
+TEST(UtilsTest, MultiTileLayout2DMatchesOracle) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({4, 4}, IndexType::get(&context));
+
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/8);
+
+  ASSERT_TRUE(succeeded(maybeRelation));
+  const IntegerRelation& relation = maybeRelation.value();
+
+  const int64_t expectedCt[4][4] = {
+      {0, 0, 0, 0},
+      {0, 0, 0, 0},
+      {1, 1, 1, 1},
+      {1, 1, 1, 1},
+  };
+
+  const int64_t expectedSlot[4][4] = {
+      {0, 4, 2, 6},
+      {1, 5, 3, 7},
+      {0, 4, 2, 6},
+      {1, 5, 3, 7},
+  };
+
+  for (int64_t i = 0; i < 4; ++i) {
+    for (int64_t j = 0; j < 4; ++j) {
+      SmallVector<int64_t> point = {
+          i, j, expectedCt[i][j], expectedSlot[i][j]};
+
+      auto contains = relation.containsPointNoLocal(point);
+      EXPECT_TRUE(contains.has_value())
+          << "missing mapping for logical coordinate (" << i << ", " << j
+          << ") to physical coordinate (" << expectedCt[i][j] << ", "
+          << expectedSlot[i][j] << ")";
+    }
+  }
+
+  // A functional layout of a 4x4 tensor must contain exactly 16 points.
+  EXPECT_EQ(relationSize(relation), 16);
+}
+
+TEST(UtilsTest, MultiTileLayout3DMatchesOracle) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({2, 4, 8}, IndexType::get(&context));
+
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/1,
+      /*columnAxis=*/2,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/8);
+
+  ASSERT_TRUE(succeeded(maybeRelation));
+  const IntegerRelation& relation = maybeRelation.value();
+
+  for (int64_t h = 0; h < 2; ++h) {
+    for (int64_t i = 0; i < 4; ++i) {
+      for (int64_t j = 0; j < 8; ++j) {
+        int64_t qL = i / 2;
+        int64_t l = i % 2;
+
+        int64_t qD = j / 2;
+        int64_t d = j % 2;
+
+        int64_t g = qD / 2;
+        int64_t p = qD % 2;
+
+        int64_t expectedCt = 4 * h + 2 * qL + g;
+        int64_t expectedSlot = 4 * d + 2 * p + l;
+
+        SmallVector<int64_t> point = {
+            h, i, j, expectedCt, expectedSlot};
+
+        auto contains = relation.containsPointNoLocal(point);
+        EXPECT_TRUE(contains.has_value())
+            << "missing mapping for logical coordinate (" << h << ", " << i
+            << ", " << j << ") to physical coordinate (" << expectedCt
+            << ", " << expectedSlot << ")";
+      }
+    }
+  }
+
+  // A functional layout of a 2x4x8 tensor must contain exactly 64 points.
+  EXPECT_EQ(relationSize(relation), 64);
+}
+
+TEST(UtilsTest, MultiTileLayoutRejectsInsufficientCapacity) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({4, 4}, IndexType::get(&context));
+
+  // Two 2x2 tiles require 2 * 2 * 2 = 8 slots.
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/7);
+
+  EXPECT_TRUE(failed(maybeRelation));
+}
+
+TEST(UtilsTest, RecognizesMultiTileLayout) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({4, 4}, IndexType::get(&context));
+
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/8);
+
+  ASSERT_TRUE(succeeded(maybeRelation));
+  const IntegerRelation& relation = maybeRelation.value();
+
+  EXPECT_TRUE(isRelationMultiTile(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/8, relation));
+
+  // The same relation must not be recognized as a layout containing only one
+  // tile per ciphertext.
+  EXPECT_FALSE(isRelationMultiTile(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/1,
+      /*numSlots=*/8, relation));
+
+  // Invalid axis selection must be rejected instead of reaching relation
+  // comparison.
+  EXPECT_FALSE(isRelationMultiTile(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/0,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/8, relation));
+}
+
+TEST(UtilsTest, MultiTileLayoutSupportsDifferentTileCounts) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({4, 4}, IndexType::get(&context));
+
+  const std::pair<int64_t, int64_t> configurations[] = {
+      // {tilesPerCiphertext, numSlots}
+      {1, 4},
+      {4, 16},
+  };
+
+  for (auto [tilesPerCiphertext, numSlots] : configurations) {
+    auto maybeRelation = getMultiTileLayoutRelation(
+        tensorType,
+        /*rowAxis=*/0,
+        /*columnAxis=*/1,
+        /*tileRows=*/2,
+        /*tileColumns=*/2,
+        tilesPerCiphertext, numSlots);
+
+    ASSERT_TRUE(succeeded(maybeRelation));
+    const IntegerRelation& relation = maybeRelation.value();
+
+    for (int64_t i = 0; i < 4; ++i) {
+      for (int64_t j = 0; j < 4; ++j) {
+        int64_t qL = i / 2;
+        int64_t qD = j / 2;
+        int64_t l = i % 2;
+        int64_t d = j % 2;
+
+        int64_t tileId = 2 * qL + qD;
+        int64_t expectedCt = tileId / tilesPerCiphertext;
+        int64_t p = tileId % tilesPerCiphertext;
+
+        int64_t expectedSlot =
+            d * (tilesPerCiphertext * 2) + p * 2 + l;
+
+        SmallVector<int64_t> point = {
+            i, j, expectedCt, expectedSlot};
+
+        EXPECT_TRUE(relation.containsPointNoLocal(point).has_value())
+            << "n_t=" << tilesPerCiphertext
+            << ", missing logical coordinate (" << i << ", " << j
+            << ") at physical coordinate (" << expectedCt << ", "
+            << expectedSlot << ")";
+      }
+    }
+
+    EXPECT_EQ(relationSize(relation), 16);
+  }
+}
+
+TEST(UtilsTest, MultiTileLayoutSupportsPartialBoundaryTiles) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({3, 5}, IndexType::get(&context));
+
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/8);
+
+  ASSERT_TRUE(succeeded(maybeRelation));
+  const IntegerRelation& relation = maybeRelation.value();
+
+  // ceil(3/2) x ceil(5/2) = 2x3 primitive tiles.
+  constexpr int64_t numTileColumns = 3;
+
+  for (int64_t i = 0; i < 3; ++i) {
+    for (int64_t j = 0; j < 5; ++j) {
+      int64_t qL = i / 2;
+      int64_t qD = j / 2;
+      int64_t l = i % 2;
+      int64_t d = j % 2;
+
+      int64_t tileId = qL * numTileColumns + qD;
+      int64_t expectedCt = tileId / 2;
+      int64_t p = tileId % 2;
+      int64_t expectedSlot = 4 * d + 2 * p + l;
+
+      SmallVector<int64_t> point = {
+          i, j, expectedCt, expectedSlot};
+
+      EXPECT_TRUE(relation.containsPointNoLocal(point).has_value())
+          << "missing boundary mapping for logical coordinate (" << i << ", "
+          << j << ") at physical coordinate (" << expectedCt << ", "
+          << expectedSlot << ")";
+    }
+  }
+
+  // Only real logical values belong to the relation. Padding slots are holes.
+  EXPECT_EQ(relationSize(relation), 15);
+}
+
+TEST(UtilsTest, MultiTileLayoutLeavesExcessSlotsUnused) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({4, 4}, IndexType::get(&context));
+
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*numSlots=*/16);
+
+  ASSERT_TRUE(succeeded(maybeRelation));
+  const IntegerRelation& relation = maybeRelation.value();
+
+  // The configuration occupies only 2*2*2 = 8 slots even though the
+  // ciphertext capacity is 16.
+  for (int64_t i = 0; i < 4; ++i) {
+    for (int64_t j = 0; j < 4; ++j) {
+      int64_t qL = i / 2;
+      int64_t qD = j / 2;
+      int64_t l = i % 2;
+      int64_t d = j % 2;
+
+      int64_t tileId = 2 * qL + qD;
+      int64_t expectedCt = tileId / 2;
+      int64_t p = tileId % 2;
+      int64_t expectedSlot = 4 * d + 2 * p + l;
+
+      EXPECT_TRUE(
+          relation
+              .containsPointNoLocal(
+                  {i, j, expectedCt, expectedSlot})
+              .has_value());
+
+      // The corresponding slot in the unused half must not be in the layout.
+      EXPECT_FALSE(
+          relation
+              .containsPointNoLocal(
+                  {i, j, expectedCt, expectedSlot + 8})
+              .has_value());
+    }
+  }
+
+  EXPECT_EQ(relationSize(relation), 16);
+}
+
+TEST(UtilsTest, SingleTileMultiTileLayoutMatchesJklsLocalLayout) {
+  MLIRContext context;
+  RankedTensorType tensorType =
+      RankedTensorType::get({2, 2}, IndexType::get(&context));
+
+  auto maybeRelation = getMultiTileLayoutRelation(
+      tensorType,
+      /*rowAxis=*/0,
+      /*columnAxis=*/1,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/1,
+      /*numSlots=*/4);
+
+  ASSERT_TRUE(succeeded(maybeRelation));
+  const IntegerRelation& actual = maybeRelation.value();
+
+  // With one tile, p=0 and the MTP embedding reduces to:
+  //
+  //   slot = d * tileRows + l
+  //        = 2*d + l
+  //
+  // The logical domain ordering is [l,d].
+  auto maybeExpected = getIntegerRelationFromIslStr(
+      "{ [l, d] -> [ct, slot] : "
+      "0 <= l <= 1 and 0 <= d <= 1 and "
+      "ct = 0 and slot - 2 * d - l = 0 and "
+      "0 <= slot <= 3 }");
+
+  ASSERT_TRUE(succeeded(maybeExpected));
+  const IntegerRelation& expected = maybeExpected.value();
+
+  EXPECT_TRUE(isRelationEqual(actual, expected));
+}
+
 TEST(UtilsTest, PeriodicReplicationRelation) {
   int64_t numSlots = 10;
   int64_t period = 3;
