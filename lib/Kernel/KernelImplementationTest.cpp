@@ -458,6 +458,364 @@ TEST_P(KernelImplementationTest, Test1DConvWithLayout) {
   EXPECT_EQ(extractedResult, expected);
 }
 
+TEST(KernelImplementationTest, MtpPhiSquareTiles) {
+  // Two 2x2 tiles:
+  //
+  //   T0 = [1 2]    T1 = [5 6]
+  //        [3 4]         [7 8]
+  //
+  // MTP physical order is d -> p -> l.
+  std::vector<int> packed = {
+      1, 3, 5, 7,
+      2, 4, 6, 8,
+  };
+
+  LiteralValue packedValue(packed);
+
+  auto dag = implementMtpPhi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/1,
+      DagType::intTensor(32, {8}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  const auto& actual = std::get<std::vector<int>>(result.get());
+
+  // Phi_1 swaps l=0 and l=1 independently for every (d, p).
+  std::vector<int> expected = {
+      3, 1, 7, 5,
+      4, 2, 8, 6,
+  };
+
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(KernelImplementationTest, MtpPhiRectangularTiles) {
+  // Two 2x3 tiles:
+  //
+  //   T0 = [1 2 3]    T1 = [ 7  8  9]
+  //        [4 5 6]         [10 11 12]
+  //
+  // Physical order d -> p -> l:
+  //
+  //   d=0: [1,4 | 7,10]
+  //   d=1: [2,5 | 8,11]
+  //   d=2: [3,6 | 9,12]
+  std::vector<int> packed = {
+      1, 4, 7, 10,
+      2, 5, 8, 11,
+      3, 6, 9, 12,
+  };
+
+  LiteralValue packedValue(packed);
+
+  auto dag = implementMtpPhi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/3,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/1,
+      DagType::intTensor(32, {12}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  const auto& actual = std::get<std::vector<int>>(result.get());
+
+  // Swap the two l coordinates independently in every (d, p) segment.
+  std::vector<int> expected = {
+      4, 1, 10, 7,
+      5, 2, 11, 8,
+      6, 3, 12, 9,
+  };
+
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(KernelImplementationTest, MtpPhiIdentityUsesNoRotations) {
+  std::vector<int> packed = {
+      1, 3, 5, 7,
+      2, 4, 6, 8,
+  };
+
+  LiteralValue packedValue(packed);
+  auto dag = implementMtpPhi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/0,
+      DagType::intTensor(32, {8}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  EXPECT_EQ(std::get<std::vector<int>>(result.get()), packed);
+
+  SymbolicValue symbolicValue({8}, /*isSecret=*/true);
+  auto symbolicDag = implementMtpPhi(
+      symbolicValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/0,
+      DagType::intTensor(32, {8}));
+
+  RotationCountVisitor rotationCounter;
+  EXPECT_EQ(rotationCounter.process(symbolicDag), 0);
+}
+
+TEST(KernelImplementationTest, MtpPhiNormalizesShifts) {
+  // Four length-3 local-row segments: two tiles for each of two columns.
+  std::vector<int> packed = {
+      1,  2,  3,  4,  5,  6,
+      7,  8,  9,  10, 11, 12,
+  };
+
+  // A local-row shift of one rotates each length-3 segment independently.
+  std::vector<int> expected = {
+      2,  3,  1,  5,  6,  4,
+      8,  9,  7,  11, 12, 10,
+  };
+
+  // All of these shifts are congruent to one modulo tileRows=3.
+  for (int64_t shift : {1, 4, -2}) {
+    LiteralValue packedValue(packed);
+    auto dag = implementMtpPhi(
+        packedValue,
+        /*tileRows=*/3,
+        /*tileColumns=*/2,
+        /*tilesPerCiphertext=*/2, shift,
+        DagType::intTensor(32, {12}));
+
+    LiteralValue result = evalKernel(dag)[0];
+    const auto& actual = std::get<std::vector<int>>(result.get());
+    EXPECT_EQ(actual, expected) << "shift=" << shift;
+  }
+}
+
+TEST(KernelImplementationTest, MtpPhiZerosExcessCapacity) {
+  // The first eight slots contain two 2x2 MTP tiles. The remaining eight
+  // slots model unused ciphertext capacity and deliberately contain nonzero
+  // values so the test can verify that the masks clear them.
+  std::vector<int> packed = {
+      1,   3,   5,   7,   2,   4,   6,   8,
+      101, 102, 103, 104, 105, 106, 107, 108,
+  };
+
+  LiteralValue packedValue(packed);
+  auto dag = implementMtpPhi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/1,
+      DagType::intTensor(32, {16}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  const auto& actual = std::get<std::vector<int>>(result.get());
+
+  std::vector<int> expected = {
+      3, 1, 7, 5, 4, 2, 8, 6,
+      0, 0, 0, 0, 0, 0, 0, 0,
+  };
+
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(KernelImplementationTest, MtpPhiRotationCountIndependentOfTileCount) {
+  constexpr int64_t tileRows = 2;
+  constexpr int64_t tileColumns = 2;
+
+  for (int64_t tilesPerCiphertext : {1, 2, 4}) {
+    int64_t numSlots =
+        tileRows * tileColumns * tilesPerCiphertext;
+
+    SymbolicValue packedValue({numSlots}, /*isSecret=*/true);
+    auto dag = implementMtpPhi(
+        packedValue, tileRows, tileColumns, tilesPerCiphertext,
+        /*shift=*/1, DagType::intTensor(32, {numSlots}));
+
+    RotationCountVisitor rotationCounter;
+    EXPECT_EQ(rotationCounter.process(dag), 2)
+        << "tilesPerCiphertext=" << tilesPerCiphertext;
+  }
+}
+
+TEST(KernelImplementationTest, MtpPsiSquareTiles) {
+  // Two 2x2 tiles in physical d -> p -> l order.
+  std::vector<int> packed = {
+      1, 3, 5, 7,
+      2, 4, 6, 8,
+  };
+
+  LiteralValue packedValue(packed);
+  auto dag = implementMtpPsi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/1,
+      DagType::intTensor(32, {8}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  const auto& actual = std::get<std::vector<int>>(result.get());
+
+  // Psi_1 swaps d=0 and d=1 while preserving every (p, l).
+  std::vector<int> expected = {
+      2, 4, 6, 8,
+      1, 3, 5, 7,
+  };
+
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(KernelImplementationTest, MtpPsiRectangularTiles) {
+  // Two 2x3 tiles:
+  //
+  //   T0 = [1 2 3]    T1 = [ 7  8  9]
+  //        [4 5 6]         [10 11 12]
+  //
+  // Physical order d -> p -> l:
+  //
+  //   d=0: [1,4 | 7,10]
+  //   d=1: [2,5 | 8,11]
+  //   d=2: [3,6 | 9,12]
+  std::vector<int> packed = {
+      1, 4, 7, 10,
+      2, 5, 8, 11,
+      3, 6, 9, 12,
+  };
+
+  LiteralValue packedValue(packed);
+  auto dag = implementMtpPsi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/3,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/1,
+      DagType::intTensor(32, {12}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  const auto& actual = std::get<std::vector<int>>(result.get());
+
+  // Cycle d regions left: [d0 | d1 | d2] -> [d1 | d2 | d0].
+  std::vector<int> expected = {
+      2, 5, 8, 11,
+      3, 6, 9, 12,
+      1, 4, 7, 10,
+  };
+
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(KernelImplementationTest, MtpPsiIdentityUsesNoRotations) {
+  std::vector<int> packed = {
+      1, 4, 7, 10,
+      2, 5, 8, 11,
+      3, 6, 9, 12,
+  };
+
+  LiteralValue packedValue(packed);
+  auto dag = implementMtpPsi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/3,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/0,
+      DagType::intTensor(32, {12}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  EXPECT_EQ(std::get<std::vector<int>>(result.get()), packed);
+
+  SymbolicValue symbolicValue({12}, /*isSecret=*/true);
+  auto symbolicDag = implementMtpPsi(
+      symbolicValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/3,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/0,
+      DagType::intTensor(32, {12}));
+
+  RotationCountVisitor rotationCounter;
+  EXPECT_EQ(rotationCounter.process(symbolicDag), 0);
+}
+
+TEST(KernelImplementationTest, MtpPsiNormalizesShifts) {
+  std::vector<int> packed = {
+      1, 4, 7, 10,
+      2, 5, 8, 11,
+      3, 6, 9, 12,
+  };
+
+  // Psi_1 cycles the three local-column regions to the left.
+  std::vector<int> expected = {
+      2, 5, 8, 11,
+      3, 6, 9, 12,
+      1, 4, 7, 10,
+  };
+
+  // All shifts are congruent to one modulo tileColumns=3.
+  for (int64_t shift : {1, 4, -2}) {
+    LiteralValue packedValue(packed);
+    auto dag = implementMtpPsi(
+        packedValue,
+        /*tileRows=*/2,
+        /*tileColumns=*/3,
+        /*tilesPerCiphertext=*/2, shift,
+        DagType::intTensor(32, {12}));
+
+    LiteralValue result = evalKernel(dag)[0];
+    const auto& actual = std::get<std::vector<int>>(result.get());
+    EXPECT_EQ(actual, expected) << "shift=" << shift;
+  }
+}
+
+TEST(KernelImplementationTest, MtpPsiZerosExcessCapacity) {
+  // The first eight slots contain two 2x2 MTP tiles. The remaining slots are
+  // unused capacity with nonzero sentinels that the masks must clear.
+  std::vector<int> packed = {
+      1,   3,   5,   7,   2,   4,   6,   8,
+      101, 102, 103, 104, 105, 106, 107, 108,
+  };
+
+  LiteralValue packedValue(packed);
+  auto dag = implementMtpPsi(
+      packedValue,
+      /*tileRows=*/2,
+      /*tileColumns=*/2,
+      /*tilesPerCiphertext=*/2,
+      /*shift=*/1,
+      DagType::intTensor(32, {16}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  const auto& actual = std::get<std::vector<int>>(result.get());
+
+  std::vector<int> expected = {
+      2, 4, 6, 8, 1, 3, 5, 7,
+      0, 0, 0, 0, 0, 0, 0, 0,
+  };
+
+  EXPECT_EQ(actual, expected);
+}
+
+TEST(KernelImplementationTest, MtpPsiRotationCountIndependentOfTileCount) {
+  constexpr int64_t tileRows = 2;
+  constexpr int64_t tileColumns = 2;
+
+  for (int64_t tilesPerCiphertext : {1, 2, 4}) {
+    int64_t numSlots =
+        tileRows * tileColumns * tilesPerCiphertext;
+
+    SymbolicValue packedValue({numSlots}, /*isSecret=*/true);
+    auto dag = implementMtpPsi(
+        packedValue, tileRows, tileColumns, tilesPerCiphertext,
+        /*shift=*/1, DagType::intTensor(32, {numSlots}));
+
+    RotationCountVisitor rotationCounter;
+    EXPECT_EQ(rotationCounter.process(dag), 2)
+        << "tilesPerCiphertext=" << tilesPerCiphertext;
+  }
+}
+
 TEST(KernelImplementationTest, BicyclicMatmul) {
   MLIRContext context;
   std::vector<std::vector<int>> matrixA = {

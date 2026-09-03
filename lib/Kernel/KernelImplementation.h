@@ -41,6 +41,180 @@ using DagExtractorDynamic = std::function<std::shared_ptr<ArithmeticDagNode<T>>(
     std::shared_ptr<ArithmeticDagNode<T>>,
     std::shared_ptr<ArithmeticDagNode<T>>)>;
 
+// Applies the JKLS Phi_k permutation independently to every MTP tile:
+//
+//   Phi_k(X)[l,d,p] = X[(l+k) mod tileRows,d,p]
+//
+// The MTP physical slot organization is:
+//
+//   slot = d * (tilesPerCiphertext * tileRows)
+//        + p * tileRows
+//        + l
+//
+// Phi_k changes only the local row coordinate l. Therefore, its rotation
+// offsets and masks depend on tileRows, while tileColumns determines how many
+// occupied tile segments are present.
+//
+// Two rotations and repeated plaintext masks prevent values from crossing
+// primitive-tile boundaries.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpPhi(const T& packed, int64_t tileRows, int64_t tileColumns,
+                int64_t tilesPerCiphertext, int64_t shift,
+                const DagType& baseType) {
+  using NodeTy = ArithmeticDagNode<T>;
+
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP Phi expects a one-dimensional packed tensor");
+  assert(packed.getShape() == baseType.getShape() &&
+         "packed value and DAG type must have the same shape");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(numSlots > 0 && "MTP Phi requires a positive slot count");
+
+  // Validate:
+  //
+  //   occupiedSlots =
+  //       tileRows * tileColumns * tilesPerCiphertext
+  //
+  // without overflowing signed int64_t.
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+
+  // Phi shifts the local row coordinate, so normalize modulo tileRows.
+  int64_t k = ((shift % tileRows) + tileRows) % tileRows;
+
+  auto input = NodeTy::leaf(packed);
+
+  // Phi_0 is the identity and requires no masks or rotations.
+  if (k == 0) return input;
+
+  // These are public plaintext masks. Slots outside the occupied MTP prefix
+  // remain zero in both masks.
+  std::vector<double> nonWrappingMask(numSlots, 0.0);
+  std::vector<double> wrappingMask(numSlots, 0.0);
+
+  for (int64_t slot = 0; slot < occupiedSlots; ++slot) {
+    // Under the D -> p -> L physical order, l is innermost.
+    int64_t l = slot % tileRows;
+
+    if (l < tileRows - k) {
+      nonWrappingMask[slot] = 1.0;
+    } else {
+      wrappingMask[slot] = 1.0;
+    }
+  }
+
+  auto nonWrappingMaskDag =
+      NodeTy::constantTensor(nonWrappingMask, baseType);
+  auto wrappingMaskDag =
+      NodeTy::constantTensor(wrappingMask, baseType);
+
+  // Non-wrapping output positions:
+  //
+  //   output[l,d,p] = input[l+k,d,p]
+  auto nonWrappingRotation = NodeTy::leftRotate(input, k);
+  auto nonWrappingPart =
+      NodeTy::mul(nonWrappingRotation, nonWrappingMaskDag);
+
+  // Wrapping output positions:
+  //
+  //   output[l,d,p] = input[l+k-tileRows,d,p]
+  auto wrappingRotation =
+      NodeTy::leftRotate(input, k - tileRows);
+  auto wrappingPart =
+      NodeTy::mul(wrappingRotation, wrappingMaskDag);
+
+  return NodeTy::add(nonWrappingPart, wrappingPart);
+}
+
+// Applies the JKLS Psi_k permutation independently to every MTP tile:
+//
+//   Psi_k(X)[l,d,p] = X[l,(d+k) mod tileColumns,p]
+//
+// Under the MTP physical layout, adjacent values of d are separated by
+// tilesPerCiphertext * tileRows slots. Two rotations and masks implement the
+// cyclic shift without wrapping values between the first and last d regions.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpPsi(const T& packed, int64_t tileRows, int64_t tileColumns,
+                int64_t tilesPerCiphertext, int64_t shift,
+                const DagType& baseType) {
+  using NodeTy = ArithmeticDagNode<T>;
+
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP Psi expects a one-dimensional packed tensor");
+  assert(packed.getShape() == baseType.getShape() &&
+         "packed value and DAG type must have the same shape");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(numSlots > 0 && "MTP Psi requires a positive slot count");
+
+  // Validate tileRows * tileColumns * tilesPerCiphertext <= numSlots
+  // without overflowing signed int64_t.
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+
+  // Psi shifts the local column coordinate, so normalize modulo tileColumns.
+  int64_t k = ((shift % tileColumns) + tileColumns) % tileColumns;
+
+  auto input = NodeTy::leaf(packed);
+  if (k == 0) return input;
+
+  int64_t columnStride = tilesPerCiphertext * tileRows;
+  std::vector<double> nonWrappingMask(numSlots, 0.0);
+  std::vector<double> wrappingMask(numSlots, 0.0);
+
+  for (int64_t slot = 0; slot < occupiedSlots; ++slot) {
+    // Each contiguous region of columnStride slots has one d coordinate.
+    int64_t d = slot / columnStride;
+
+    if (d < tileColumns - k) {
+      nonWrappingMask[slot] = 1.0;
+    } else {
+      wrappingMask[slot] = 1.0;
+    }
+  }
+
+  auto nonWrappingMaskDag =
+      NodeTy::constantTensor(nonWrappingMask, baseType);
+  auto wrappingMaskDag =
+      NodeTy::constantTensor(wrappingMask, baseType);
+
+  // Non-wrapping output positions read from d+k.
+  auto nonWrappingRotation =
+      NodeTy::leftRotate(input, k * columnStride);
+  auto nonWrappingPart =
+      NodeTy::mul(nonWrappingRotation, nonWrappingMaskDag);
+
+  // Wrapping output positions read from d+k-tileColumns.
+  auto wrappingRotation =
+      NodeTy::leftRotate(input, (k - tileColumns) * columnStride);
+  auto wrappingPart = NodeTy::mul(wrappingRotation, wrappingMaskDag);
+
+  return NodeTy::add(nonWrappingPart, wrappingPart);
+}
+
 // Returns an arithmetic DAG that implements a matvec kernel. Ensure this is
 // only generated for T a subclass of AbstractValue.
 template <typename T>
