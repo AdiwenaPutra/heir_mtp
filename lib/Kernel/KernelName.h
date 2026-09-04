@@ -34,6 +34,10 @@ enum KernelName : int {
   // Ciphertext-ciphertext batch matmul using the tricyclic packing method.
   BatchMatmulTricyclic,
 
+  // Ciphertext-ciphertext batch matmul applying JKLS independently to aligned
+  // square tiles co-located with multi-tile packing.
+  BatchMatmulMtpJkls,
+
   // Ciphertext-plaintext matmul by mapping the plaintext into n generalized
   // diagonals. This covers both secret-lhs-plaintext-rhs and
   // plaintext-lhs-secret-rhs cases.

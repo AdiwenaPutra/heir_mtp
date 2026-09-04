@@ -1068,6 +1068,31 @@ TEST(KernelImplementationTest, MtpJklsMatmulMultiplePackedTiles) {
             std::vector<int>({19, 22, 8, 2, 43, 50, 10, 16}));
 }
 
+TEST(KernelImplementationTest, MtpJklsMatmulCiphertextTensor) {
+  // Each row is one ciphertext containing two independently valued 2x2 tile
+  // pairs in d -> p -> l order. Rotations and masks must act independently on
+  // the final slot dimension without mixing the two ciphertext rows.
+  LiteralValue packedA(std::vector<std::vector<int>>{
+      {1, 2, 2, 0, 3, 4, 1, 3},
+      {1, 0, 2, 1, 0, 1, 0, 3},
+  });
+  LiteralValue packedB(std::vector<std::vector<int>>{
+      {5, 6, 4, 1, 7, 8, 2, 5},
+      {4, 5, 1, 2, 6, 7, 3, 4},
+  });
+
+  auto dag = implementMtpJklsMatmul(
+      packedA, packedB, /*tileSize=*/2, /*tilesPerCiphertext=*/2,
+      DagType::intTensor(32, {2, 8}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  EXPECT_EQ(std::get<std::vector<std::vector<int>>>(result.get()),
+            (std::vector<std::vector<int>>{
+                {19, 22, 8, 2, 43, 50, 10, 16},
+                {4, 5, 5, 8, 6, 7, 9, 12},
+            }));
+}
+
 TEST(KernelImplementationTest, MtpJklsMatmulThreeByThreeTile) {
   // Multiplication by identity exercises all k=0,1,2 terms while making the
   // expected result easy to inspect.

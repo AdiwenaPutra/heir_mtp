@@ -41,6 +41,36 @@ using DagExtractorDynamic = std::function<std::shared_ptr<ArithmeticDagNode<T>>(
     std::shared_ptr<ArithmeticDagNode<T>>,
     std::shared_ptr<ArithmeticDagNode<T>>)>;
 
+struct MtpPackedShape {
+  int64_t numCiphertexts;
+  int64_t numSlots;
+};
+
+// Standalone kernel tests use [slots], while ciphertext-semantics conversion
+// represents a ciphertext tensor as [ciphertexts, slots]. In both cases,
+// ciphertext rotations act independently on the final slot dimension.
+inline MtpPackedShape getMtpPackedShape(const DagType& baseType) {
+  const auto& shape = baseType.getShape();
+  assert((shape.size() == 1 || shape.size() == 2) &&
+         "MTP expects [slots] or [ciphertexts, slots]");
+  int64_t numCiphertexts = shape.size() == 1 ? 1 : shape[0];
+  int64_t numSlots = shape.back();
+  assert(numCiphertexts > 0 &&
+         "MTP requires a positive ciphertext count");
+  assert(numSlots > 0 && "MTP requires a positive slot count");
+  return {numCiphertexts, numSlots};
+}
+
+inline std::vector<double> repeatMtpSlotMask(
+    const std::vector<double>& slotMask, int64_t numCiphertexts) {
+  std::vector<double> repeated;
+  repeated.reserve(numCiphertexts * slotMask.size());
+  for (int64_t ct = 0; ct < numCiphertexts; ++ct) {
+    repeated.insert(repeated.end(), slotMask.begin(), slotMask.end());
+  }
+  return repeated;
+}
+
 // Applies the JKLS Phi_k permutation independently to every MTP tile:
 //
 //   Phi_k(X)[l,d,p] = X[(l+k) mod tileRows,d,p]
@@ -69,13 +99,10 @@ implementMtpPhi(const T& packed, int64_t tileRows, int64_t tileColumns,
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP Phi expects a one-dimensional packed tensor");
   assert(packed.getShape() == baseType.getShape() &&
          "packed value and DAG type must have the same shape");
 
-  int64_t numSlots = baseType.getShape()[0];
-  assert(numSlots > 0 && "MTP Phi requires a positive slot count");
+  auto [numCiphertexts, numSlots] = getMtpPackedShape(baseType);
 
   // Validate:
   //
@@ -115,10 +142,10 @@ implementMtpPhi(const T& packed, int64_t tileRows, int64_t tileColumns,
     }
   }
 
-  auto nonWrappingMaskDag =
-      NodeTy::constantTensor(nonWrappingMask, baseType);
-  auto wrappingMaskDag =
-      NodeTy::constantTensor(wrappingMask, baseType);
+  auto nonWrappingMaskDag = NodeTy::constantTensor(
+      repeatMtpSlotMask(nonWrappingMask, numCiphertexts), baseType);
+  auto wrappingMaskDag = NodeTy::constantTensor(
+      repeatMtpSlotMask(wrappingMask, numCiphertexts), baseType);
 
   // Non-wrapping output positions:
   //
@@ -157,13 +184,10 @@ implementMtpPsi(const T& packed, int64_t tileRows, int64_t tileColumns,
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP Psi expects a one-dimensional packed tensor");
   assert(packed.getShape() == baseType.getShape() &&
          "packed value and DAG type must have the same shape");
 
-  int64_t numSlots = baseType.getShape()[0];
-  assert(numSlots > 0 && "MTP Psi requires a positive slot count");
+  auto [numCiphertexts, numSlots] = getMtpPackedShape(baseType);
 
   // Validate tileRows * tileColumns * tilesPerCiphertext <= numSlots
   // without overflowing signed int64_t.
@@ -196,10 +220,10 @@ implementMtpPsi(const T& packed, int64_t tileRows, int64_t tileColumns,
     }
   }
 
-  auto nonWrappingMaskDag =
-      NodeTy::constantTensor(nonWrappingMask, baseType);
-  auto wrappingMaskDag =
-      NodeTy::constantTensor(wrappingMask, baseType);
+  auto nonWrappingMaskDag = NodeTy::constantTensor(
+      repeatMtpSlotMask(nonWrappingMask, numCiphertexts), baseType);
+  auto wrappingMaskDag = NodeTy::constantTensor(
+      repeatMtpSlotMask(wrappingMask, numCiphertexts), baseType);
 
   // Non-wrapping output positions read from d+k.
   auto nonWrappingRotation =
@@ -229,12 +253,9 @@ implementMtpSlotPermutation(
   using NodeTy = ArithmeticDagNode<T>;
   using NodePtr = std::shared_ptr<NodeTy>;
 
-  assert(baseType.getShape().size() == 1 &&
-         "MTP permutation expects a one-dimensional packed tensor");
   assert(input && "MTP permutation requires a non-null input DAG");
 
-  int64_t numSlots = baseType.getShape()[0];
-  assert(numSlots > 0 && "MTP permutation requires a positive slot count");
+  auto [numCiphertexts, numSlots] = getMtpPackedShape(baseType);
   assert(occupiedSlots > 0 && occupiedSlots <= numSlots &&
          "occupied MTP slots must fit in the packed tensor");
 
@@ -258,7 +279,8 @@ implementMtpSlotPermutation(
 
   NodePtr result;
   for (auto& [shift, mask] : masksByShift) {
-    auto maskDag = NodeTy::constantTensor(mask, baseType);
+    auto maskDag = NodeTy::constantTensor(
+        repeatMtpSlotMask(mask, numCiphertexts), baseType);
     auto shifted = shift == 0 ? input : NodeTy::leftRotate(input, shift);
     auto selected = NodeTy::mul(shifted, maskDag);
     result = result ? NodeTy::add(result, selected) : selected;
@@ -292,11 +314,9 @@ std::shared_ptr<ArithmeticDagNode<T>> implementMtpPhiOnDag(
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP Phi expects a one-dimensional packed tensor");
   assert(input && "MTP Phi requires a non-null input DAG");
 
-  int64_t numSlots = baseType.getShape()[0];
+  int64_t numSlots = getMtpPackedShape(baseType).numSlots;
   assert(tileRows <= numSlots / tileColumns &&
          "one MTP tile does not fit in the available slots");
   int64_t slotsPerTile = tileRows * tileColumns;
@@ -329,11 +349,9 @@ std::shared_ptr<ArithmeticDagNode<T>> implementMtpPsiOnDag(
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP Psi expects a one-dimensional packed tensor");
   assert(input && "MTP Psi requires a non-null input DAG");
 
-  int64_t numSlots = baseType.getShape()[0];
+  int64_t numSlots = getMtpPackedShape(baseType).numSlots;
   assert(tileRows <= numSlots / tileColumns &&
          "one MTP tile does not fit in the available slots");
   int64_t slotsPerTile = tileRows * tileColumns;
@@ -370,10 +388,7 @@ implementMtpSigma(const T& packed, int64_t tileRows, int64_t tileColumns,
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP sigma expects a one-dimensional packed tensor");
-
-  int64_t numSlots = baseType.getShape()[0];
+  int64_t numSlots = getMtpPackedShape(baseType).numSlots;
   assert(tileRows <= numSlots / tileColumns &&
          "one MTP tile does not fit in the available slots");
   int64_t slotsPerTile = tileRows * tileColumns;
@@ -411,10 +426,7 @@ implementMtpTau(const T& packed, int64_t tileRows, int64_t tileColumns,
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP tau expects a one-dimensional packed tensor");
-
-  int64_t numSlots = baseType.getShape()[0];
+  int64_t numSlots = getMtpPackedShape(baseType).numSlots;
   assert(tileRows <= numSlots / tileColumns &&
          "one MTP tile does not fit in the available slots");
   int64_t slotsPerTile = tileRows * tileColumns;
@@ -453,10 +465,7 @@ implementMtpTranspose(const T& packed, int64_t tileRows,
   assert(tileColumns > 0 && "MTP tile column count must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP transpose expects a one-dimensional packed tensor");
-
-  int64_t numSlots = baseType.getShape()[0];
+  int64_t numSlots = getMtpPackedShape(baseType).numSlots;
   assert(tileRows <= numSlots / tileColumns &&
          "one MTP tile does not fit in the available slots");
   int64_t slotsPerTile = tileRows * tileColumns;
@@ -503,14 +512,12 @@ implementMtpJklsMatmul(const T& packedA, const T& packedB,
   assert(tileSize > 0 && "JKLS tile size must be positive");
   assert(tilesPerCiphertext > 0 &&
          "MTP tiles per ciphertext must be positive");
-  assert(baseType.getShape().size() == 1 &&
-         "MTP-JKLS expects a one-dimensional packed tensor");
   assert(packedA.getShape() == baseType.getShape() &&
          "packed A and DAG type must have the same shape");
   assert(packedB.getShape() == baseType.getShape() &&
          "packed B and DAG type must have the same shape");
 
-  int64_t numSlots = baseType.getShape()[0];
+  int64_t numSlots = getMtpPackedShape(baseType).numSlots;
   assert(tileSize <= numSlots / tileSize &&
          "one square JKLS tile does not fit in the available slots");
   int64_t slotsPerTile = tileSize * tileSize;

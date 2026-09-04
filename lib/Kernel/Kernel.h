@@ -33,6 +33,8 @@ struct FieldParser<heir::KernelName> {
       return heir::KernelName::MatmulBicyclicDiagonal;
     if (kernelName == "BatchMatmulTricyclic")
       return heir::KernelName::BatchMatmulTricyclic;
+    if (kernelName == "BatchMatmulMtpJkls")
+      return heir::KernelName::BatchMatmulMtpJkls;
     if (kernelName == "Dot") return heir::KernelName::Dot;
 
     return failure();

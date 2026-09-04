@@ -67,6 +67,21 @@ EvalResults EvalVisitor::operator()(const AddNode<LiteralValue>& node) {
     return {result};
   }
 
+  const auto* lMatrix =
+      std::get_if<std::vector<std::vector<int>>>(&lVal);
+  const auto* rMatrix =
+      std::get_if<std::vector<std::vector<int>>>(&rVal);
+  if (lMatrix && rMatrix) {
+    assert(left.getShape() == right.getShape() && "disagreeing shapes");
+    std::vector<std::vector<int>> result = *lMatrix;
+    for (size_t row = 0; row < result.size(); ++row) {
+      for (size_t column = 0; column < result[row].size(); ++column) {
+        result[row][column] += (*rMatrix)[row][column];
+      }
+    }
+    return {result};
+  }
+
   // If types are not supported, just return left as dummy
   return {left};
 }
@@ -94,6 +109,21 @@ EvalResults EvalVisitor::operator()(const SubtractNode<LiteralValue>& node) {
     std::vector<int> result(dim);
     for (size_t i = 0; i < dim; ++i) {
       result[i] = (*lVec)[i] - (*rVec)[i];
+    }
+    return {result};
+  }
+
+  const auto* lMatrix =
+      std::get_if<std::vector<std::vector<int>>>(&lVal);
+  const auto* rMatrix =
+      std::get_if<std::vector<std::vector<int>>>(&rVal);
+  if (lMatrix && rMatrix) {
+    assert(left.getShape() == right.getShape() && "disagreeing shapes");
+    std::vector<std::vector<int>> result = *lMatrix;
+    for (size_t row = 0; row < result.size(); ++row) {
+      for (size_t column = 0; column < result[row].size(); ++column) {
+        result[row][column] -= (*rMatrix)[row][column];
+      }
     }
     return {result};
   }
@@ -126,6 +156,21 @@ EvalResults EvalVisitor::operator()(const MultiplyNode<LiteralValue>& node) {
     std::vector<int> result(dim);
     for (size_t i = 0; i < dim; ++i) {
       result[i] = (*lVec)[i] * (*rVec)[i];
+    }
+    return {result};
+  }
+
+  const auto* lMatrix =
+      std::get_if<std::vector<std::vector<int>>>(&lVal);
+  const auto* rMatrix =
+      std::get_if<std::vector<std::vector<int>>>(&rVal);
+  if (lMatrix && rMatrix) {
+    assert(left.getShape() == right.getShape() && "disagreeing shapes");
+    std::vector<std::vector<int>> result = *lMatrix;
+    for (size_t row = 0; row < result.size(); ++row) {
+      for (size_t column = 0; column < result[row].size(); ++column) {
+        result[row][column] *= (*rMatrix)[row][column];
+      }
     }
     return {result};
   }
@@ -172,7 +217,19 @@ EvalResults EvalVisitor::operator()(const LeftRotateNode<LiteralValue>& node) {
     return {result};
   }
 
-  // If the operand is not a 1D vector (e.g., a 2D float tensor), return as-is.
+  if (const auto* oMatrix =
+          std::get_if<std::vector<std::vector<int>>>(&oVal)) {
+    std::vector<std::vector<int>> result = *oMatrix;
+    for (size_t row = 0; row < result.size(); ++row) {
+      for (size_t column = 0; column < result[row].size(); ++column) {
+        result[row][column] =
+            (*oMatrix)[row][(column + amount) % oMatrix->at(row).size()];
+      }
+    }
+    return {result};
+  }
+
+  // If the operand is not a supported integer tensor, return it as-is.
   return {operand};
 }
 
@@ -278,6 +335,20 @@ EvalResults EvalVisitor::operator()(const ConstantTensorNode& node) {
   vec.reserve(node.value.size());
   for (double v : node.value) {
     vec.push_back(static_cast<int>(v));
+  }
+
+  const auto& shape = node.type.getShape();
+  if (shape.size() == 2) {
+    assert(static_cast<int64_t>(vec.size()) == shape[0] * shape[1] &&
+           "constant data does not match its rank-2 tensor shape");
+    std::vector<std::vector<int>> matrix(
+        shape[0], std::vector<int>(shape[1]));
+    for (int64_t row = 0; row < shape[0]; ++row) {
+      for (int64_t column = 0; column < shape[1]; ++column) {
+        matrix[row][column] = vec[row * shape[1] + column];
+      }
+    }
+    return {matrix};
   }
   return {LiteralValue(vec)};
 }

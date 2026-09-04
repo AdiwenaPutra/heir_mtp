@@ -2959,6 +2959,104 @@ struct ConvertLinalgBatchMatmul
     return dyn_cast<LayoutAttr>(layoutLookup.value());
   }
 
+  bool supportsMtpJkls(linalg::BatchMatmulOp op) const {
+    auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
+        secret::SecretDialect::kKernelAttrName);
+    return kernelAttr &&
+           kernelAttr.getName() == KernelName::BatchMatmulMtpJkls;
+  }
+
+  LogicalResult mtpJklsKernel(
+      linalg::BatchMatmulOp op, OpAdaptor adaptor,
+      ContextAwareConversionPatternRewriter& rewriter) const {
+    LLVM_DEBUG(llvm::dbgs()
+               << "Converting linalg.batch_matmul op with MTP-JKLS kernel: "
+               << op << "\n");
+
+    auto lhsType = cast<RankedTensorType>(op.getInputs()[0].getType());
+    auto rhsType = cast<RankedTensorType>(op.getInputs()[1].getType());
+    auto resultType = cast<RankedTensorType>(op.getResult(0).getType());
+
+    int64_t batch = lhsType.getDimSize(0);
+    int64_t tileSize = lhsType.getDimSize(1);
+    if (tileSize != lhsType.getDimSize(2) ||
+        rhsType.getShape() != lhsType.getShape() ||
+        resultType.getShape() != lhsType.getShape()) {
+      return op.emitOpError(
+          "MTP-JKLS requires equally shaped [batch, tileSize, tileSize] "
+          "operands and result");
+    }
+
+    auto lhs = cast<TypedValue<RankedTensorType>>(adaptor.getInputs()[0]);
+    auto rhs = cast<TypedValue<RankedTensorType>>(adaptor.getInputs()[1]);
+    auto packedLhsType = lhs.getType();
+    auto packedRhsType = rhs.getType();
+    if (packedLhsType.getRank() != 2 ||
+        packedRhsType != packedLhsType) {
+      return op.emitOpError(
+          "MTP-JKLS requires equally shaped [ciphertexts, slots] packed "
+          "operands");
+    }
+
+    int64_t numCiphertexts = packedLhsType.getDimSize(0);
+    int64_t numSlots = packedLhsType.getDimSize(1);
+    if (batch <= 0 || tileSize <= 0 || numCiphertexts <= 0 || numSlots <= 0 ||
+        numCiphertexts > batch) {
+      return op.emitOpError("MTP-JKLS requires positive static dimensions");
+    }
+    int64_t tilesPerCiphertext =
+        (batch + numCiphertexts - 1) / numCiphertexts;
+    if (tileSize > numSlots / tileSize ||
+        tilesPerCiphertext > numSlots / (tileSize * tileSize)) {
+      return op.emitOpError(
+          "MTP-JKLS tiles do not fit in the packed slot dimension");
+    }
+
+    LayoutAttr lhsLayout = getLayoutAttr(lhs);
+    LayoutAttr rhsLayout = getLayoutAttr(rhs);
+    auto resultLayout = dyn_cast_or_null<LayoutAttr>(
+        op->getAttr(kLayoutAttrName));
+    auto hasExpectedMtpLayout = [&](RankedTensorType type,
+                                    LayoutAttr layout) {
+      return layout && isRelationMultiTile(
+                           type, /*rowAxis=*/2, /*columnAxis=*/1,
+                           /*tileRows=*/tileSize,
+                           /*tileColumns=*/tileSize, tilesPerCiphertext,
+                           numSlots, layout.getIntegerRelation());
+    };
+    if (!hasExpectedMtpLayout(lhsType, lhsLayout) ||
+        !hasExpectedMtpLayout(rhsType, rhsLayout) ||
+        !hasExpectedMtpLayout(resultType, resultLayout)) {
+      return op.emitOpError(
+          "MTP-JKLS requires matching row-major multi-tile layouts on both "
+          "operands and the result");
+    }
+
+    SSAValue lhsLeaf(lhs);
+    SSAValue rhsLeaf(rhs);
+    auto dagType = kernel::mlirTypeToDagType(packedLhsType);
+    auto implementedKernel = kernel::implementMtpJklsMatmul(
+        lhsLeaf, rhsLeaf, tileSize, tilesPerCiphertext, dagType);
+
+    rewriter.setInsertionPointAfter(op);
+    ImplicitLocOpBuilder b(op.getLoc(), rewriter);
+    IRMaterializingVisitor visitor(packedLhsType, [&](Operation* createdOp) {
+      setMaterializedAttr(createdOp);
+    });
+    Value finalOutput = visitor.process(implementedKernel, b)[0];
+
+    finalOutput.getDefiningOp()->setAttr(kLayoutAttrName, resultLayout);
+    setMaterializedAttr(finalOutput.getDefiningOp());
+
+    Value accumulator = adaptor.getOutputs()[0];
+    Operation* addBias =
+        makeAppropriatelyTypedAddOp(b, op.getLoc(), finalOutput, accumulator);
+    addBias->setAttr(kLayoutAttrName, resultLayout);
+    setMaterializedAttr(addBias);
+    rewriter.replaceOp(op, addBias->getResult(0));
+    return success();
+  }
+
   bool supportsTricyclic(linalg::BatchMatmulOp op, OpAdaptor adaptor) const {
     auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
         secret::SecretDialect::kKernelAttrName);
@@ -3031,6 +3129,9 @@ struct ConvertLinalgBatchMatmul
   LogicalResult matchAndRewrite(
       linalg::BatchMatmulOp op, OpAdaptor adaptor,
       ContextAwareConversionPatternRewriter& rewriter) const final {
+    if (supportsMtpJkls(op)) {
+      return mtpJklsKernel(op, adaptor, rewriter);
+    }
     if (supportsTricyclic(op, adaptor)) {
       tricyclicKernel(op, adaptor, rewriter);
       return success();

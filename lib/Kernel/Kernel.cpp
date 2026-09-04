@@ -38,6 +38,8 @@ std::string kernelNameAsStr(const KernelName& kernelName) {
       return "MatmulBicyclicDiagonal";
     case KernelName::BatchMatmulTricyclic:
       return "BatchMatmulTricyclic";
+    case KernelName::BatchMatmulMtpJkls:
+      return "BatchMatmulMtpJkls";
     case KernelName::Dot:
       return "Dot";
     default:
