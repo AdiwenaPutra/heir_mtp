@@ -274,6 +274,7 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   // Op-specific transfer functions
   LogicalResult visitOperation(CollapseShapeOp op);
   LogicalResult visitOperation(ExpandShapeOp op);
+  LogicalResult visitOperation(AssignLayoutOp op);
   LogicalResult visitOperation(GenericOp op);
   LogicalResult visitOperation(ReduceOp op);
   LogicalResult visitOperation(Conv1DOp op);
@@ -460,6 +461,8 @@ LogicalResult LayoutPropagation::visitOperation(Operation* op) {
           [&](auto op) { return visitOperation(op); })
       // secret ops
       .Case<GenericOp, YieldOp>([&](auto op) { return visitOperation(op); })
+      // explicit layout assignment
+      .Case<AssignLayoutOp>([&](auto op) { return visitOperation(op); })
       // linalg ops
       .Case<DotOp, MatvecOp, VecmatOp, ReduceOp, MatmulOp, BatchMatmulOp,
             Conv1DOp, Conv1DNcwFcwOp, Conv2DOp, Conv2DNchwFchwOp>(
@@ -478,22 +481,35 @@ LogicalResult LayoutPropagation::visitOperation(Operation* op) {
 }
 
 LogicalResult LayoutPropagation::visitOperation(func::FuncOp op) {
-  // Set a default value for each secret argument
+  // Preserve a user-specified layout on secret arguments. Otherwise, assign
+  // the default row-major layout.
   for (Value arg : op.getArguments()) {
     if (!isSecret(arg, solver)) {
       // Cleartext arguments don't get layouts, they are later given
       // assign_layout ops and materialized to plaintexts server-side.
       continue;
     }
-    FailureOr<LayoutAttr> layout = defaultLayoutForType(arg.getType());
-    if (failed(layout)) {
-      return op->emitOpError()
-             << "Failed to assign default layout to func argument " << arg;
+    Attribute layout;
+    auto existingLayout = findAttributeAssociatedWith(
+        arg, tensor_ext::TensorExtDialect::kLayoutAttrName);
+    if (succeeded(existingLayout)) {
+      layout = existingLayout.value();
+      if (!isa<LayoutAttr, ArrayAttr>(layout)) {
+        return op->emitOpError()
+               << "Expected a layout attribute on func argument " << arg;
+      }
+    } else {
+      FailureOr<LayoutAttr> defaultLayout = defaultLayoutForType(arg.getType());
+      if (failed(defaultLayout)) {
+        return op->emitOpError()
+               << "Failed to assign default layout to func argument " << arg;
+      }
+      layout = defaultLayout.value();
     }
-    debugAssignLayout(arg, layout.value());
-    assignedLayouts.insert({arg, layout.value()});
+    debugAssignLayout(arg, layout);
+    assignedLayouts.insert({arg, layout});
     setAttributeAssociatedWith(
-        arg, tensor_ext::TensorExtDialect::kLayoutAttrName, layout.value());
+        arg, tensor_ext::TensorExtDialect::kLayoutAttrName, layout);
 
     // Set a default kernel info for each secret argument.
     if (auto tensorType = dyn_cast<RankedTensorType>(
@@ -508,6 +524,15 @@ LogicalResult LayoutPropagation::visitOperation(func::FuncOp op) {
   }
 
   // Func result attrs are handled by the ReturnOp
+  return success();
+}
+
+LogicalResult LayoutPropagation::visitOperation(AssignLayoutOp op) {
+  Attribute layout = op.getLayout();
+  assignedLayouts.insert({op.getResult(), layout});
+  setAttributeAssociatedWith(
+      op.getResult(), tensor_ext::TensorExtDialect::kLayoutAttrName, layout);
+  debugAssignLayout(op.getResult(), layout);
   return success();
 }
 
@@ -1283,6 +1308,40 @@ LogicalResult LayoutPropagation::visitOperation(BatchMatmulOp op) {
 
   bool inputSecret = isSecret(lhs, solver);
   bool filterSecret = isSecret(rhs, solver);
+
+  // A forced MTP-JKLS kernel carries an explicit layout contract. Respect it
+  // instead of selecting the default tricyclic batch-matmul layout. Detailed
+  // MTP shape and capacity validation is performed when the kernel is
+  // materialized by ConvertToCiphertextSemantics.
+  auto kernelAttr = op->getAttrOfType<secret::KernelAttr>(
+      secret::SecretDialect::kKernelAttrName);
+  if (kernelAttr && kernelAttr.getForce() &&
+      kernelAttr.getName() == KernelName::BatchMatmulMtpJkls) {
+    auto targetLayout = op->getAttrOfType<LayoutAttr>(
+        tensor_ext::TensorExtDialect::kLayoutAttrName);
+    if (!targetLayout) {
+      return op->emitError()
+             << "forced BatchMatmulMtpJkls requires an explicit layout";
+    }
+
+    for (Value operand : {lhs, rhs}) {
+      LayoutAttr operandLayout = getComposedLayoutAttr(operand);
+      if (!isRelationEqual(operandLayout.getIntegerRelation(),
+                           targetLayout.getIntegerRelation())) {
+        auto [converted, convertedLayout] = convertToLayout(
+            ctx, builder, op, operand, operandLayout,
+            targetLayout.getIntegerRelation());
+        debugAssignLayout(converted, convertedLayout);
+        assignedLayouts.insert({converted, convertedLayout});
+      }
+    }
+
+    assignedLayouts.insert({result, targetLayout});
+    setResultLayoutAttr(op);
+    debugAssignLayout(result, targetLayout);
+    return alignInitWithResultLayout(op, op.getOutputs().front(),
+                                     targetLayout);
+  }
 
   LLVM_DEBUG(llvm::dbgs() << "lhs=" << lhs << ";\nrhs=" << rhs << "\n");
 
