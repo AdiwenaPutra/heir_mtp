@@ -257,3 +257,16 @@ cc_test(
         "@llvm-project//mlir:Support",
     ],
 )
+
+cc_test(
+    name = "MtpJklsMatmulFuzzTest",
+    srcs = ["MtpJklsMatmulFuzzTest.cpp"],
+    deps = [
+        ":AbstractValue",
+        ":ArithmeticDag",
+        ":EvalVisitor",
+        ":KernelImplementation",
+        "@fuzztest//fuzztest",
+        "@fuzztest//fuzztest:fuzztest_gtest_main",
+    ],
+)
