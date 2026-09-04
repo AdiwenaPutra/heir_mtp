@@ -215,6 +215,325 @@ implementMtpPsi(const T& packed, int64_t tileRows, int64_t tileColumns,
   return NodeTy::add(nonWrappingPart, wrappingPart);
 }
 
+// Builds an MTP slot permutation from a map that gives the source slot for
+// every occupied output slot. Output slots requiring the same cyclic rotation
+// are grouped behind one repeated public mask. Slots outside occupiedSlots are
+// zeroed by construction.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpSlotPermutation(
+    std::shared_ptr<ArithmeticDagNode<T>> input, int64_t occupiedSlots,
+    const DagType& baseType,
+    const std::function<int64_t(int64_t)>& sourceSlotForOutput) {
+  using NodeTy = ArithmeticDagNode<T>;
+  using NodePtr = std::shared_ptr<NodeTy>;
+
+  assert(baseType.getShape().size() == 1 &&
+         "MTP permutation expects a one-dimensional packed tensor");
+  assert(input && "MTP permutation requires a non-null input DAG");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(numSlots > 0 && "MTP permutation requires a positive slot count");
+  assert(occupiedSlots > 0 && occupiedSlots <= numSlots &&
+         "occupied MTP slots must fit in the packed tensor");
+
+  // A left rotation by r makes output slot s read input slot (s+r) mod N.
+  // Group output positions by that required rotation so every distinct shift
+  // is performed only once.
+  std::map<int64_t, std::vector<double>> masksByShift;
+  for (int64_t outputSlot = 0; outputSlot < occupiedSlots; ++outputSlot) {
+    int64_t sourceSlot = sourceSlotForOutput(outputSlot);
+    assert(sourceSlot >= 0 && sourceSlot < occupiedSlots &&
+           "MTP permutation source must be an occupied slot");
+
+    int64_t shift = sourceSlot - outputSlot;
+    shift = ((shift % numSlots) + numSlots) % numSlots;
+    auto it = masksByShift
+                  .try_emplace(shift,
+                               std::vector<double>(numSlots, 0.0))
+                  .first;
+    it->second[outputSlot] = 1.0;
+  }
+
+  NodePtr result;
+  for (auto& [shift, mask] : masksByShift) {
+    auto maskDag = NodeTy::constantTensor(mask, baseType);
+    auto shifted = shift == 0 ? input : NodeTy::leftRotate(input, shift);
+    auto selected = NodeTy::mul(shifted, maskDag);
+    result = result ? NodeTy::add(result, selected) : selected;
+  }
+
+  assert(result && "an MTP permutation must have at least one output slot");
+  return result;
+}
+
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpSlotPermutation(
+    const T& packed, int64_t occupiedSlots, const DagType& baseType,
+    const std::function<int64_t(int64_t)>& sourceSlotForOutput) {
+  assert(packed.getShape() == baseType.getShape() &&
+         "packed value and DAG type must have the same shape");
+  return implementMtpSlotPermutation<T>(
+      ArithmeticDagNode<T>::leaf(packed), occupiedSlots, baseType,
+      sourceSlotForOutput);
+}
+
+// Applies Phi_k to an existing arithmetic DAG. This node-level form is used
+// when composing Phi_k after sigma inside the complete JKLS kernel.
+template <typename T>
+std::shared_ptr<ArithmeticDagNode<T>> implementMtpPhiOnDag(
+    std::shared_ptr<ArithmeticDagNode<T>> input, int64_t tileRows,
+    int64_t tileColumns, int64_t tilesPerCiphertext, int64_t shift,
+    const DagType& baseType) {
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP Phi expects a one-dimensional packed tensor");
+  assert(input && "MTP Phi requires a non-null input DAG");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+  int64_t columnStride = tilesPerCiphertext * tileRows;
+  int64_t k = ((shift % tileRows) + tileRows) % tileRows;
+  if (k == 0) return input;
+
+  return implementMtpSlotPermutation<T>(
+      input, occupiedSlots, baseType, [&](int64_t outputSlot) {
+        int64_t d = outputSlot / columnStride;
+        int64_t withinColumn = outputSlot % columnStride;
+        int64_t p = withinColumn / tileRows;
+        int64_t l = withinColumn % tileRows;
+        int64_t sourceL = (l + k) % tileRows;
+        return d * columnStride + p * tileRows + sourceL;
+      });
+}
+
+// Applies Psi_k to an existing arithmetic DAG. This node-level form is used
+// when composing Psi_k after tau inside the complete JKLS kernel.
+template <typename T>
+std::shared_ptr<ArithmeticDagNode<T>> implementMtpPsiOnDag(
+    std::shared_ptr<ArithmeticDagNode<T>> input, int64_t tileRows,
+    int64_t tileColumns, int64_t tilesPerCiphertext, int64_t shift,
+    const DagType& baseType) {
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP Psi expects a one-dimensional packed tensor");
+  assert(input && "MTP Psi requires a non-null input DAG");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+  int64_t columnStride = tilesPerCiphertext * tileRows;
+  int64_t k = ((shift % tileColumns) + tileColumns) % tileColumns;
+  if (k == 0) return input;
+
+  return implementMtpSlotPermutation<T>(
+      input, occupiedSlots, baseType, [&](int64_t outputSlot) {
+        int64_t d = outputSlot / columnStride;
+        int64_t withinColumn = outputSlot % columnStride;
+        int64_t p = withinColumn / tileRows;
+        int64_t l = withinColumn % tileRows;
+        int64_t sourceD = (d + k) % tileColumns;
+        return sourceD * columnStride + p * tileRows + l;
+      });
+}
+
+// Applies the JKLS sigma permutation independently to every MTP tile:
+//
+//   sigma(X)[l,d,p] = X[(l+d) mod tileRows,d,p]
+//
+// The source displacement is independent of p, so the number of rotations
+// does not grow with tilesPerCiphertext.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpSigma(const T& packed, int64_t tileRows, int64_t tileColumns,
+                  int64_t tilesPerCiphertext, const DagType& baseType) {
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP sigma expects a one-dimensional packed tensor");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+  int64_t columnStride = tilesPerCiphertext * tileRows;
+
+  return implementMtpSlotPermutation<T>(
+      packed, occupiedSlots, baseType, [&](int64_t outputSlot) {
+        int64_t d = outputSlot / columnStride;
+        int64_t withinColumn = outputSlot % columnStride;
+        int64_t p = withinColumn / tileRows;
+        int64_t l = withinColumn % tileRows;
+        int64_t sourceL = (l + d) % tileRows;
+        return d * columnStride + p * tileRows + sourceL;
+      });
+}
+
+// Applies the JKLS tau permutation independently to every MTP tile:
+//
+//   tau(X)[l,d,p] = X[l,(d+l) mod tileColumns,p]
+//
+// The source displacement is independent of p, so the number of rotations
+// does not grow with tilesPerCiphertext. When the occupied MTP region fills
+// the ciphertext exactly, cyclic ciphertext rotation also implements the
+// wrap between the last and first d regions; square tiles then require only
+// tileRows - 1 nonzero rotations.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpTau(const T& packed, int64_t tileRows, int64_t tileColumns,
+                int64_t tilesPerCiphertext, const DagType& baseType) {
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP tau expects a one-dimensional packed tensor");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+  int64_t columnStride = tilesPerCiphertext * tileRows;
+
+  return implementMtpSlotPermutation<T>(
+      packed, occupiedSlots, baseType, [&](int64_t outputSlot) {
+        int64_t d = outputSlot / columnStride;
+        int64_t withinColumn = outputSlot % columnStride;
+        int64_t p = withinColumn / tileRows;
+        int64_t l = withinColumn % tileRows;
+        int64_t sourceD = (d + l) % tileColumns;
+        return sourceD * columnStride + p * tileRows + l;
+      });
+}
+
+// Transposes every MTP tile. The input tile has shape tileRows x tileColumns;
+// the output is interpreted using the MTP layout for tileColumns x tileRows:
+//
+//   transpose(X)[l,d,p] = X[d,l,p]
+//
+// For square tiles the tile-position term cancels from every displacement, so
+// the rotation count is independent of tilesPerCiphertext. Rectangular tiles
+// are also supported, but changing the physical segment width makes some
+// displacements depend on p.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpTranspose(const T& packed, int64_t tileRows,
+                      int64_t tileColumns, int64_t tilesPerCiphertext,
+                      const DagType& baseType) {
+  assert(tileRows > 0 && "MTP tile row count must be positive");
+  assert(tileColumns > 0 && "MTP tile column count must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP transpose expects a one-dimensional packed tensor");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(tileRows <= numSlots / tileColumns &&
+         "one MTP tile does not fit in the available slots");
+  int64_t slotsPerTile = tileRows * tileColumns;
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+  int64_t occupiedSlots = tilesPerCiphertext * slotsPerTile;
+
+  int64_t outputTileRows = tileColumns;
+  int64_t outputColumnStride = tilesPerCiphertext * outputTileRows;
+  int64_t inputColumnStride = tilesPerCiphertext * tileRows;
+
+  return implementMtpSlotPermutation<T>(
+      packed, occupiedSlots, baseType, [&](int64_t outputSlot) {
+        int64_t outputD = outputSlot / outputColumnStride;
+        int64_t withinColumn = outputSlot % outputColumnStride;
+        int64_t p = withinColumn / outputTileRows;
+        int64_t outputL = withinColumn % outputTileRows;
+
+        // Output coordinate (outputL, outputD) reads input coordinate
+        // (outputD, outputL).
+        int64_t sourceL = outputD;
+        int64_t sourceD = outputL;
+        return sourceD * inputColumnStride + p * tileRows + sourceL;
+      });
+}
+
+// Implements the JKLS ciphertext-ciphertext matrix multiplication on every
+// aligned square MTP tile pair:
+//
+//   C = sum_k Phi_k(sigma(A)) * Psi_k(tau(B)).
+//
+// Under the JKLS/MTP coordinate correspondence, d is the matrix row and l is
+// the matrix column. The returned slots therefore encode C = A * B in the same
+// d -> p -> l physical order. Relinearization and rescaling are intentionally
+// left to HEIR's scheme-management passes.
+template <typename T>
+std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
+                 std::shared_ptr<ArithmeticDagNode<T>>>
+implementMtpJklsMatmul(const T& packedA, const T& packedB,
+                       int64_t tileSize, int64_t tilesPerCiphertext,
+                       const DagType& baseType) {
+  using NodeTy = ArithmeticDagNode<T>;
+
+  assert(tileSize > 0 && "JKLS tile size must be positive");
+  assert(tilesPerCiphertext > 0 &&
+         "MTP tiles per ciphertext must be positive");
+  assert(baseType.getShape().size() == 1 &&
+         "MTP-JKLS expects a one-dimensional packed tensor");
+  assert(packedA.getShape() == baseType.getShape() &&
+         "packed A and DAG type must have the same shape");
+  assert(packedB.getShape() == baseType.getShape() &&
+         "packed B and DAG type must have the same shape");
+
+  int64_t numSlots = baseType.getShape()[0];
+  assert(tileSize <= numSlots / tileSize &&
+         "one square JKLS tile does not fit in the available slots");
+  int64_t slotsPerTile = tileSize * tileSize;
+  assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
+         "MTP tiles do not fit in the available slots");
+
+  auto sigmaA = implementMtpSigma(packedA, tileSize, tileSize,
+                                  tilesPerCiphertext, baseType);
+  auto tauB = implementMtpTau(packedB, tileSize, tileSize,
+                              tilesPerCiphertext, baseType);
+
+  auto result = NodeTy::mul(sigmaA, tauB);
+  for (int64_t k = 1; k < tileSize; ++k) {
+    auto shiftedA = implementMtpPhiOnDag(
+        sigmaA, tileSize, tileSize, tilesPerCiphertext, k, baseType);
+    auto shiftedB = implementMtpPsiOnDag(
+        tauB, tileSize, tileSize, tilesPerCiphertext, k, baseType);
+    result = NodeTy::add(result, NodeTy::mul(shiftedA, shiftedB));
+  }
+
+  return result;
+}
+
 // Returns an arithmetic DAG that implements a matvec kernel. Ensure this is
 // only generated for T a subclass of AbstractValue.
 template <typename T>
