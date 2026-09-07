@@ -4,6 +4,7 @@
 # bazel output symlinks
 bazel-bin
 bazel-heir
+bazel-heir_mtp
 bazel-out
 bazel-testlogs
 

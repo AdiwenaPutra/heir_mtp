@@ -138,6 +138,80 @@ std::pair<Value, LayoutAttr> convertToLayout(
   return std::make_pair(toReplace, layoutAttr);
 }
 
+// Validated packing parameters for automatic selection of the MTP-JKLS
+// kernel/layout on an ordinary (unannotated) batch_matmul.
+// `tilesPerCiphertext` uses balanced packing: the minimum ciphertext count
+// implied by raw capacity, with tiles spread as evenly as possible across
+// those ciphertexts. This is required, not optional — it is the formula
+// `ConvertLinalgBatchMatmul::mtpJklsKernel` independently recovers from the
+// physical shape (`ceil(batch / numCiphertexts)`) below, in
+// ConvertToCiphertextSemantics.cpp. An earlier maximum-fill formula
+// (`min(batch, capacity)` tiles in each of the first ciphertexts) disagreed
+// with that recovery for some — not all — batches that do not divide
+// capacity evenly: e.g. for capacity=5, batch=11 disagrees (5 vs. recovered
+// 4) but batch=9 happens to agree (5 vs. recovered 5) despite also having a
+// remainder. See the `mtp_jkls_batch_matmul_auto_disagreement` tests
+// (layout_propagation and convert_to_ciphertext_semantics packages) for a
+// case — batch=7, capacity=5 — that actually exercises the disagreement:
+// under the old formula, that case would fail materialization outright.
+struct MtpJklsAutoSelectionParams {
+  int64_t mu;
+  int64_t tilesPerCiphertext;
+};
+
+// Ceiling division for known-positive operands, without computing
+// `value + divisor - 1` (which can overflow `int64_t` when `value` is near
+// its max). Mirrors `ceilDivPositive` in lib/Utils/Layout/Utils.cpp.
+int64_t ceilDivPositive(int64_t value, int64_t divisor) {
+  return 1 + (value - 1) / divisor;
+}
+
+// Returns the validated MTP-JKLS packing parameters for an eligible
+// unannotated secret-secret linalg.batch_matmul, or failure if the shapes do
+// not satisfy the eligibility contract: identical ranked, statically shaped
+// [batch, mu, mu] operands/result with a positive batch and mu, and a single
+// mu x mu tile fitting in one ciphertext. Never computes `mu * mu` before
+// establishing it cannot overflow relative to `minSlotCount`, and uses
+// `ceilDivPositive` rather than the `(a + b - 1) / b` idiom for both ceiling
+// divisions below. `ConvertLinalgBatchMatmul::mtpJklsKernel`'s paired
+// recovery of `tilesPerCiphertext` in ConvertToCiphertextSemantics.cpp reads
+// `batch` from the same logical operand type this function does, so it is
+// reachable with the same values and was fixed to use the same safe idiom.
+FailureOr<MtpJklsAutoSelectionParams> getMtpJklsAutoSelectionParams(
+    RankedTensorType lhsType, RankedTensorType rhsType,
+    RankedTensorType resultType, int64_t minSlotCount) {
+  if (!lhsType.hasStaticShape() || !rhsType.hasStaticShape() ||
+      !resultType.hasStaticShape()) {
+    return failure();
+  }
+  if (lhsType.getRank() != 3 || rhsType.getShape() != lhsType.getShape() ||
+      resultType.getShape() != lhsType.getShape()) {
+    return failure();
+  }
+
+  int64_t batch = lhsType.getDimSize(0);
+  int64_t mu = lhsType.getDimSize(1);
+  if (mu != lhsType.getDimSize(2) || batch <= 0 || mu <= 0 ||
+      minSlotCount <= 0) {
+    return failure();
+  }
+  // Overflow-safe check of `mu * mu <= minSlotCount`: avoids computing
+  // `mu * mu` unless it is already known not to exceed minSlotCount.
+  if (mu > minSlotCount / mu) {
+    return failure();
+  }
+
+  int64_t slotsPerTile = mu * mu;
+  int64_t capacity = minSlotCount / slotsPerTile;
+  if (capacity <= 0) {
+    return failure();
+  }
+  int64_t numCiphertexts = ceilDivPositive(batch, capacity);
+  int64_t tilesPerCiphertext = ceilDivPositive(batch, numCiphertexts);
+
+  return MtpJklsAutoSelectionParams{mu, tilesPerCiphertext};
+}
+
 // The outcome of folding a zero `tensor.pad` on the spatial dims into a conv's
 // own `padding` parameter.
 struct FoldedConvPadding {
@@ -1354,6 +1428,55 @@ LogicalResult LayoutPropagation::visitOperation(BatchMatmulOp op) {
   if (!filterSecret) {
     return builder.notifyMatchFailure(
         op, "ct-pt batch matrix multiplication is not supported");
+  }
+
+  // Automatically select MTP-JKLS for an eligible unannotated
+  // [batch, mu, mu] secret-secret batch matmul when enabled. An ineligible
+  // shape (including one enabled but not [batch, mu, mu], e.g. the
+  // rectangular tricyclic-eligible case) is not reinterpreted as MTP here;
+  // it falls through to the existing tricyclic selection below unchanged.
+  if (enableMtpJkls) {
+    RankedTensorType autoResultType = cast<RankedTensorType>(result.getType());
+    FailureOr<MtpJklsAutoSelectionParams> autoParams =
+        getMtpJklsAutoSelectionParams(lhsType, rhsType, autoResultType,
+                                      minSlotCount);
+    if (succeeded(autoParams)) {
+      FailureOr<presburger::IntegerRelation> autoRelation =
+          getMultiTileLayoutRelation(lhsType, /*rowAxis=*/2, /*columnAxis=*/1,
+                                     /*tileRows=*/autoParams->mu,
+                                     /*tileColumns=*/autoParams->mu,
+                                     autoParams->tilesPerCiphertext,
+                                     minSlotCount);
+      if (succeeded(autoRelation)) {
+        LayoutAttr autoTargetLayout =
+            LayoutAttr::getFromIntegerRelation(ctx, *autoRelation);
+
+        for (Value operand : {lhs, rhs}) {
+          LayoutAttr operandLayout = getComposedLayoutAttr(operand);
+          if (!isRelationEqual(operandLayout.getIntegerRelation(),
+                               *autoRelation)) {
+            auto [converted, convertedLayout] = convertToLayout(
+                ctx, builder, op, operand, operandLayout, *autoRelation);
+            debugAssignLayout(converted, convertedLayout);
+            assignedLayouts.insert({converted, convertedLayout});
+          }
+        }
+
+        assignedLayouts.insert({result, autoTargetLayout});
+        setResultLayoutAttr(op);
+        debugAssignLayout(result, autoTargetLayout);
+
+        auto autoKernelAttr = secret::KernelAttr::get(
+            ctx, KernelName::BatchMatmulMtpJkls, /*force=*/false);
+        op->setAttr(secret::SecretDialect::kKernelAttrName, autoKernelAttr);
+
+        return alignInitWithResultLayout(op, op.getOutputs().front(),
+                                         autoTargetLayout);
+      }
+      LLVM_DEBUG(llvm::dbgs()
+                 << "MTP-JKLS auto-selection: eligible shape but relation "
+                    "construction failed; falling back to tricyclic\n");
+    }
   }
 
   int64_t hLhs = lhsType.getDimSize(0);

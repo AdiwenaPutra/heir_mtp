@@ -207,6 +207,7 @@ void mlirToSecretArithmeticPipelineBuilder(
   // Layout assignment and optimization
   LayoutPropagationOptions layoutPropagationOptions;
   layoutPropagationOptions.minSlotCount = options.minSlotCount;
+  layoutPropagationOptions.enableMtpJkls = options.enableMtpJkls;
   pm.addPass(createLayoutPropagation(layoutPropagationOptions));
   LayoutOptimizationOptions layoutOptimizationOptions;
   layoutOptimizationOptions.minSlotCount = options.minSlotCount;

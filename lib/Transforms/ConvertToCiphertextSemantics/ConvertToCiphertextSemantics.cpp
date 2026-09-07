@@ -3004,8 +3004,10 @@ struct ConvertLinalgBatchMatmul
         numCiphertexts > batch) {
       return op.emitOpError("MTP-JKLS requires positive static dimensions");
     }
-    int64_t tilesPerCiphertext =
-        (batch + numCiphertexts - 1) / numCiphertexts;
+    // Ceiling division without computing `batch + numCiphertexts - 1`
+    // (overflow-prone when batch is near int64_t's max; batch and
+    // numCiphertexts are both already checked positive above).
+    int64_t tilesPerCiphertext = 1 + (batch - 1) / numCiphertexts;
     if (tileSize > numSlots / tileSize ||
         tilesPerCiphertext > numSlots / (tileSize * tileSize)) {
       return op.emitOpError(

@@ -51,6 +51,15 @@ def LayoutPropagation : Pass<"layout-propagation"> {
       "int",
       /*default=*/"1024",
       "Minimum number of slots to use for packing messages in ciphertexts."
+    >,
+    Option<
+      "enableMtpJkls",
+      "enable-mtp-jkls",
+      "bool",
+      /*default=*/"false",
+      "If true, automatically select the MTP-JKLS kernel and layout for "
+      "eligible unannotated secret-secret [batch, mu, mu] "
+      "linalg.batch_matmul ops."
     >
   ];
 

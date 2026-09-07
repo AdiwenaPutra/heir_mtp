@@ -42,6 +42,13 @@ struct MlirToRLWEPipelineOptions : public LoopOptions {
       llvm::cl::desc("The minimum number of slots needed to pack cleartexts; "
                      "this is a lower bound on the ring degree."),
       llvm::cl::init(1024)};
+  PassOptions::Option<bool> enableMtpJkls{
+      *this, "enable-mtp-jkls",
+      llvm::cl::desc(
+          "If true, automatically select the MTP-JKLS kernel and layout for "
+          "eligible unannotated secret-secret [batch, mu, mu] "
+          "linalg.batch_matmul ops (default to false)"),
+      llvm::cl::init(false)};
   PassOptions::Option<bool> usePublicKey{
       *this, "use-public-key",
       llvm::cl::desc("If true, use public key encryption (default to true)"),
