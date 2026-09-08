@@ -12,6 +12,8 @@
 #include "lib/Kernel/KernelName.h"
 #include "lib/Utils/Layout/TilePlanningMtpJkls.h"
 #include "lib/Utils/Layout/Utils.h"
+#include "llvm/include/llvm/ADT/DenseMap.h"                 // from @llvm-project
+#include "llvm/include/llvm/ADT/STLExtras.h"                // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlow/Utils.h"     // from @llvm-project
 #include "mlir/include/mlir/Analysis/DataFlowFramework.h"  // from @llvm-project
 #include "mlir/include/mlir/Analysis/Presburger/IntegerRelation.h"  // from @llvm-project
@@ -45,39 +47,86 @@ struct TilePlanningMtpJkls
 
 namespace {
 
-// Builds a [1, mu, mu] tensor by extracting the mu x mu sub-rectangle of
-// `source` at offset (0,0) and inserting it into a fresh zero-seeded,
-// explicitly laid-out batch tensor -- the same zero-seed-plus-valid-extent
-// scatter primitive already validated by hand-written fixtures for this
-// pass's eventual generalization to multiple tasks. This always extracts
-// the FULL mu x mu source with no boundary handling: it is only ever
-// called on an operand already confirmed (by the caller's exact
-// M == K == N == mu eligibility check, not by computeGemmTilePlan alone --
-// see the caller) to be exactly mu x mu, never smaller.
-Value assembleSingleTaskBatch(ImplicitLocOpBuilder& b, Value source,
-                              int64_t mu, LayoutAttr mtpLayout) {
+// Extracts and memoizes (keyed by `tileId`, one of GemmTask's
+// lhsTileId/rhsTileId/destTileId) the mu x mu tile of `source` located at
+// logical tile-row `tileRow`, tile-column `tileCol` (offset (tileRow*mu,
+// tileCol*mu)). Multiple tasks that share the same tileId -- e.g. P8.3's
+// fixed lhs, which has the SAME lhsTileId for every destination-column task
+// sharing that row tile -- reuse the exact same extracted SSA value rather
+// than re-extracting it redundantly. This is also what lets a downstream
+// test directly prove tile reuse (or, for distinct tileIds, tile
+// distinctness) by operand identity rather than by structural shape alone.
+Value getOrExtractTile(ImplicitLocOpBuilder& b, Value source,
+                       llvm::DenseMap<int64_t, Value>& cache, int64_t tileId,
+                       int64_t tileRow, int64_t tileCol, int64_t mu) {
+  auto it = cache.find(tileId);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  RankedTensorType sourceType = cast<RankedTensorType>(source.getType());
+  RankedTensorType tileType =
+      RankedTensorType::get({mu, mu}, sourceType.getElementType());
+  SmallVector<OpFoldResult> offsets{b.getIndexAttr(tileRow * mu),
+                                   b.getIndexAttr(tileCol * mu)};
+  SmallVector<OpFoldResult> sizes{b.getIndexAttr(mu), b.getIndexAttr(mu)};
+  SmallVector<OpFoldResult> strides(2, b.getIndexAttr(1));
+  Value tile = tensor::ExtractSliceOp::create(b, tileType, source, offsets,
+                                              sizes, strides);
+  cache.insert({tileId, tile});
+  return tile;
+}
+
+// Builds a [taskCount, mu, mu] physical batch tensor for one GEMM operand
+// role (lhs, rhs, or init/dest), scattering each of `plan`'s tasks' tiles --
+// located via `tileId`/`tileRow`/`tileCol`, reusing computeGemmTilePlan's own
+// (i,q)/(q,j)/(i,j) task coordinates rather than recomputing tile indexing --
+// into that task's own `position` within a fresh, explicitly (and hence
+// authoritative, per LayoutPropagation.cpp's destination-authority
+// mechanism) zero-seeded batch. Chained sibling inserts (one per task) are
+// required here exactly as validated by the Phase 8 B2 spike fixture: the
+// destination's fixed MTP addressing must survive unmodified through every
+// insert, while each differently-positioned incoming tile is reconciled to
+// it instead. For a single-task plan (taskCount == 1, the P8.2 case) this
+// reduces to exactly one iteration at position 0 and reproduces the prior
+// assembleSingleTaskBatch's IR byte-for-byte.
+Value assembleMultiTaskBatch(
+    ImplicitLocOpBuilder& b, Value source, const GemmTilePlan& plan,
+    LayoutAttr mtpLayout, int64_t mu, llvm::DenseMap<int64_t, Value>& cache,
+    llvm::function_ref<int64_t(const GemmTask&)> tileId,
+    llvm::function_ref<int64_t(const GemmTask&)> tileRow,
+    llvm::function_ref<int64_t(const GemmTask&)> tileCol) {
   RankedTensorType sourceType = cast<RankedTensorType>(source.getType());
   Type elementType = sourceType.getElementType();
-  RankedTensorType tileType = RankedTensorType::get({mu, mu}, elementType);
-  RankedTensorType batchType = RankedTensorType::get({1, mu, mu}, elementType);
+  RankedTensorType batchType =
+      RankedTensorType::get({plan.taskCount, mu, mu}, elementType);
 
-  SmallVector<OpFoldResult> tileOffsets(2, b.getIndexAttr(0));
-  SmallVector<OpFoldResult> tileSizes{b.getIndexAttr(mu), b.getIndexAttr(mu)};
-  SmallVector<OpFoldResult> tileStrides(2, b.getIndexAttr(1));
-  Value tile = tensor::ExtractSliceOp::create(b, tileType, source, tileOffsets,
-                                              tileSizes, tileStrides);
-
-  Value zero = arith::ConstantOp::create(
-      b, batchType, DenseElementsAttr::get(batchType, b.getZeroAttr(elementType)));
-  auto zeroLayoutOp = AssignLayoutOp::create(b, zero, mtpLayout);
-  zeroLayoutOp->setAttr(TensorExtDialect::kLayoutAttrName, mtpLayout);
-
-  SmallVector<OpFoldResult> batchOffsets(3, b.getIndexAttr(0));
-  SmallVector<OpFoldResult> batchSizes{b.getIndexAttr(1), b.getIndexAttr(mu),
-                                       b.getIndexAttr(mu)};
-  SmallVector<OpFoldResult> batchStrides(3, b.getIndexAttr(1));
-  return tensor::InsertSliceOp::create(b, tile, zeroLayoutOp.getResult(),
-                                       batchOffsets, batchSizes, batchStrides);
+  Value batch;
+  for (const GemmTask& task : plan.tasks) {
+    // Extract (or reuse) this task's tile BEFORE lazily constructing the
+    // zero-seeded authoritative destination on the first iteration --
+    // matching assembleSingleTaskBatch's original op order (extract, then
+    // zero/assign_layout, then insert) exactly, so the single-task (P8.2)
+    // case reproduces byte-identical IR.
+    Value tile = getOrExtractTile(b, source, cache, tileId(task),
+                                  tileRow(task), tileCol(task), mu);
+    if (!batch) {
+      Value zero = arith::ConstantOp::create(
+          b, batchType,
+          DenseElementsAttr::get(batchType, b.getZeroAttr(elementType)));
+      auto zeroLayoutOp = AssignLayoutOp::create(b, zero, mtpLayout);
+      zeroLayoutOp->setAttr(TensorExtDialect::kLayoutAttrName, mtpLayout);
+      batch = zeroLayoutOp.getResult();
+    }
+    SmallVector<OpFoldResult> insertOffsets{b.getIndexAttr(task.position),
+                                            b.getIndexAttr(0),
+                                            b.getIndexAttr(0)};
+    SmallVector<OpFoldResult> insertSizes{b.getIndexAttr(1), b.getIndexAttr(mu),
+                                          b.getIndexAttr(mu)};
+    SmallVector<OpFoldResult> insertStrides(3, b.getIndexAttr(1));
+    batch = tensor::InsertSliceOp::create(b, tile, batch, insertOffsets,
+                                          insertSizes, insertStrides);
+  }
+  return batch;
 }
 
 }  // namespace
@@ -133,31 +182,44 @@ void TilePlanningMtpJkls::runOnOperation() {
       return;  // Malformed matmul; leave for normal verification elsewhere.
     }
 
-    if (M != mu || K != mu || N != mu) {
-      // Anything other than an exact full mu x mu x mu tile is out of scope
-      // for this P8.2 checkpoint -- including a smaller-than-mu single-task
-      // shape, which computeGemmTilePlan still legitimately reports as
-      // taskCount=1 (I=Q=J=1) with a boundary (validRows/validContraction/
-      // validColumns < mu): that is a real, well-defined plan, but
-      // assembleSingleTaskBatch below always extracts a full mu x mu region
-      // at offset (0,0), which would run out-of-bounds -- and hence produce
-      // invalid IR, not just an imprecise result -- for anything smaller.
-      // Handling that boundary correctly (extract the valid sub-rectangle,
-      // zero-pad) is exactly the P8.3+ generalization, not this checkpoint.
-      return;
-    }
-
     FailureOr<GemmTilePlan> plan =
         computeGemmTilePlan(M, K, N, mu, minSlotCount);
     if (failed(plan)) {
       return;  // Ineligible mu/minSlotCount (e.g. mu*mu > minSlotCount):
                // fall through untouched.
     }
-    if (plan->taskCount != 1 || plan->Q != 1) {
-      // Unreachable given M=K=N=mu above (which always yields I=Q=J=1), but
-      // never rewrite on an assumption alone -- if this weren't
-      // taskCount=1, it would be a general B2/B3/B6 case, out of scope for
-      // this checkpoint.
+
+    if (plan->Q != 1) {
+      // A contraction depth spanning more than one tile requires chaining
+      // the batch_matmul's `outs` across q-steps to accumulate partial
+      // products -- that reduction is P8.4, not this checkpoint. Leave any
+      // such shape (a B3-style case) completely untouched.
+      return;
+    }
+
+    // Every task must be a full, non-boundary mu x mu x mu tile: boundary
+    // tiles (M, K, or N not evenly divisible by mu) require extracting only
+    // the valid sub-rectangle and zero-padding the rest, which is a
+    // deliberately separate, not-yet-implemented generalization (tracked for
+    // a later phase). Rejecting here, rather than assuming full extents
+    // always hold, is what keeps assembleMultiTaskBatch below safe: it always
+    // extracts a full mu x mu region at each task's tile offset.
+    bool hasBoundaryTile = llvm::any_of(plan->tasks, [&](const GemmTask& t) {
+      return t.validRows != mu || t.validContraction != mu ||
+             t.validColumns != mu;
+    });
+    if (hasBoundaryTile) {
+      return;
+    }
+
+    if (plan->numCiphertexts != 1) {
+      // More than one physical ciphertext group means the taskCount
+      // destination tiles cannot all be assembled into a single [taskCount,
+      // mu, mu] batch tensor addressed by getMultiTileLayoutRelation alone --
+      // scattering across multiple ciphertext groups is out-of-scope
+      // multi-group scheduling work, not this checkpoint's tile-planning
+      // generalization. Leave such shapes untouched rather than emit a
+      // partially-correct single-group batch.
       return;
     }
 
@@ -176,15 +238,15 @@ void TilePlanningMtpJkls::runOnOperation() {
     rewriter.setInsertionPoint(op);
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
 
-    RankedTensorType batchType = RankedTensorType::get({1, mu, mu}, elementType);
-    // taskCount == 1 was already established above, so
-    // getBalancedMtpPacking(1, mu, mu, minSlotCount) -- called again inside
-    // computeGemmTilePlan -- always yields tilesPerCiphertext == 1; recompute
-    // the plan here (cheap, pure arithmetic) rather than threading it through
-    // eligibleOps, since only tilesPerCiphertext is needed at this point.
+    // Recompute the plan here (cheap, pure arithmetic) rather than threading
+    // it through eligibleOps: every field this loop needs (taskCount,
+    // tilesPerCiphertext, and the tasks themselves) is deterministically
+    // reproduced from the same M/K/N/mu/minSlotCount already validated above.
     FailureOr<GemmTilePlan> plan = computeGemmTilePlan(
         lhsType.getDimSize(0), lhsType.getDimSize(1),
         cast<RankedTensorType>(rhs.getType()).getDimSize(1), mu, minSlotCount);
+    RankedTensorType batchType =
+        RankedTensorType::get({plan->taskCount, mu, mu}, elementType);
     FailureOr<presburger::IntegerRelation> mtpRelation =
         getMultiTileLayoutRelation(batchType, /*rowAxis=*/2, /*columnAxis=*/1,
                                    /*tileRows=*/mu, /*tileColumns=*/mu,
@@ -197,15 +259,36 @@ void TilePlanningMtpJkls::runOnOperation() {
     }
     LayoutAttr mtpLayout = LayoutAttr::getFromIntegerRelation(ctx, *mtpRelation);
 
-    Value lhsBatch = assembleSingleTaskBatch(b, lhs, mu, mtpLayout);
-    Value rhsBatch = assembleSingleTaskBatch(b, rhs, mu, mtpLayout);
-    // The real init/outs operand is gathered exactly like lhs/rhs. This is
-    // what preserves linalg.matmul's own `result = init + lhs @ rhs`
-    // semantics through the rewrite: the forced-kernel batch_matmul below
-    // accumulates onto whatever is passed as its own `outs`, and the JKLS
-    // primitive it reuses already correctly does so for a real, possibly
-    // nonzero init (validated by the Phase 8 spike's B3 fixture).
-    Value initBatch = assembleSingleTaskBatch(b, init, mu, mtpLayout);
+    // lhsTileId = i*Q+q identifies each task's source lhs tile at (row=i,
+    // col=q); with Q == 1 established above, every task sharing a given i
+    // shares the same lhsTileId (P8.3's "same lhs feeds multiple
+    // destination-column tasks" case) and getOrExtractTile reuses that
+    // extraction. rhsTileId = q*J+j and destTileId = i*J+j are each unique
+    // per (q,j) and per (i,j) respectively, so rhs and init/dest tiles are
+    // never spuriously shared across distinct tasks.
+    llvm::DenseMap<int64_t, Value> lhsCache, rhsCache, initCache;
+    Value lhsBatch = assembleMultiTaskBatch(
+        b, lhs, *plan, mtpLayout, mu, lhsCache,
+        [](const GemmTask& t) { return t.lhsTileId; },
+        [](const GemmTask& t) { return t.i; },
+        [](const GemmTask& t) { return t.q; });
+    Value rhsBatch = assembleMultiTaskBatch(
+        b, rhs, *plan, mtpLayout, mu, rhsCache,
+        [](const GemmTask& t) { return t.rhsTileId; },
+        [](const GemmTask& t) { return t.q; },
+        [](const GemmTask& t) { return t.j; });
+    // The real init/outs operand is gathered exactly like lhs/rhs, one real
+    // Cinit tile per destination. This is what preserves linalg.matmul's own
+    // `result = init + lhs @ rhs` semantics through the rewrite: the
+    // forced-kernel batch_matmul below accumulates onto whatever is passed
+    // as its own `outs`, and the JKLS primitive it reuses already correctly
+    // does so, per batch element, for a real, possibly nonzero init
+    // (validated by the Phase 8 spike's B3 fixture).
+    Value initBatch = assembleMultiTaskBatch(
+        b, init, *plan, mtpLayout, mu, initCache,
+        [](const GemmTask& t) { return t.destTileId; },
+        [](const GemmTask& t) { return t.i; },
+        [](const GemmTask& t) { return t.j; });
 
     auto kernelAttr = secret::KernelAttr::get(ctx, KernelName::BatchMatmulMtpJkls,
                                               /*force=*/true);
@@ -215,20 +298,70 @@ void TilePlanningMtpJkls::runOnOperation() {
     batchMatmulOp->setAttr(secret::SecretDialect::kKernelAttrName, kernelAttr);
     batchMatmulOp->setAttr(TensorExtDialect::kLayoutAttrName, mtpLayout);
 
-    SmallVector<OpFoldResult> resultOffsets(3, b.getIndexAttr(0));
-    SmallVector<OpFoldResult> resultSizes{b.getIndexAttr(1), b.getIndexAttr(mu),
-                                          b.getIndexAttr(mu)};
-    SmallVector<OpFoldResult> resultStrides(3, b.getIndexAttr(1));
-    Value resultTile = tensor::ExtractSliceOp::create(
-        b, RankedTensorType::get({mu, mu}, elementType),
-        batchMatmulOp.getResult(0), resultOffsets, resultSizes, resultStrides);
+    Value finalResult;
+    if (plan->taskCount == 1) {
+      // The single destination tile IS the whole output already (the
+      // established P8.2 behavior): extract it directly, with no separate
+      // scatter into a shared destination.
+      SmallVector<OpFoldResult> resultOffsets(3, b.getIndexAttr(0));
+      SmallVector<OpFoldResult> resultSizes{
+          b.getIndexAttr(1), b.getIndexAttr(mu), b.getIndexAttr(mu)};
+      SmallVector<OpFoldResult> resultStrides(3, b.getIndexAttr(1));
+      finalResult = tensor::ExtractSliceOp::create(
+          b, RankedTensorType::get({mu, mu}, elementType),
+          batchMatmulOp.getResult(0), resultOffsets, resultSizes,
+          resultStrides);
+    } else {
+      // P8.3: multiple destination tiles. Scatter each task's result tile
+      // into its own (task.i*mu, task.j*mu) region of a fresh, explicitly
+      // (and hence authoritative) row-major MxN output accumulator -- the
+      // same destination-authority scatter pattern already validated for
+      // the standalone Phase 8 B2 LayoutPropagation fixture, now driven end
+      // to end from an ordinary linalg.matmul. Every (i,j) in [0,I)x[0,J) has
+      // exactly one task (Q == 1 and no boundary tiles were both established
+      // above), so every element of the accumulator is written exactly once
+      // and the initial zero never survives to the final result.
+      RankedTensorType outputType =
+          cast<RankedTensorType>(op->getResult(0).getType());
+      presburger::IntegerRelation outputRelation =
+          getRowMajorLayoutRelation(outputType, minSlotCount);
+      LayoutAttr outputLayout =
+          LayoutAttr::getFromIntegerRelation(ctx, outputRelation);
 
-    // M = N = mu exactly for this single-task (I = J = 1) case, so
-    // resultTile's type already exactly matches the original op's result
-    // type: it IS the whole output, and no separate scatter into a shared
-    // destination is needed here (that step is what P8.3's I*J > 1 case
-    // requires).
-    rewriter.replaceOp(op, resultTile);
+      Value outputZero = arith::ConstantOp::create(
+          b, outputType,
+          DenseElementsAttr::get(outputType, b.getZeroAttr(elementType)));
+      auto outputZeroLayoutOp =
+          AssignLayoutOp::create(b, outputZero, outputLayout);
+      outputZeroLayoutOp->setAttr(TensorExtDialect::kLayoutAttrName,
+                                  outputLayout);
+
+      Value outputAccum = outputZeroLayoutOp.getResult();
+      for (const GemmTask& task : plan->tasks) {
+        SmallVector<OpFoldResult> extractOffsets{b.getIndexAttr(task.position),
+                                                 b.getIndexAttr(0),
+                                                 b.getIndexAttr(0)};
+        SmallVector<OpFoldResult> extractSizes{
+            b.getIndexAttr(1), b.getIndexAttr(mu), b.getIndexAttr(mu)};
+        SmallVector<OpFoldResult> extractStrides(3, b.getIndexAttr(1));
+        Value resultTile = tensor::ExtractSliceOp::create(
+            b, RankedTensorType::get({mu, mu}, elementType),
+            batchMatmulOp.getResult(0), extractOffsets, extractSizes,
+            extractStrides);
+
+        SmallVector<OpFoldResult> scatterOffsets{
+            b.getIndexAttr(task.i * mu), b.getIndexAttr(task.j * mu)};
+        SmallVector<OpFoldResult> scatterSizes{b.getIndexAttr(mu),
+                                               b.getIndexAttr(mu)};
+        SmallVector<OpFoldResult> scatterStrides(2, b.getIndexAttr(1));
+        outputAccum = tensor::InsertSliceOp::create(
+            b, resultTile, outputAccum, scatterOffsets, scatterSizes,
+            scatterStrides);
+      }
+      finalResult = outputAccum;
+    }
+
+    rewriter.replaceOp(op, finalResult);
   }
 }
 
