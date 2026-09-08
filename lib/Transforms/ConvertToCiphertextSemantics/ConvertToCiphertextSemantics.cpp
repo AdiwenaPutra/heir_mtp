@@ -2035,7 +2035,8 @@ class ConvertTensorInsertSlice
     auto maybeSliceLayout = getSliceInsertionRelation(
         op.getSourceType(), op.getResultType(),
         SmallVector<int64_t>(op.getStaticOffsets()),
-        SmallVector<int64_t>(op.getStaticSizes()), staticStrides);
+        SmallVector<int64_t>(op.getStaticSizes()), staticStrides,
+        op.getDroppedDims());
     if (failed(maybeSliceLayout)) {
       return op.emitError() << "failed to get layout for insert slice";
     }
@@ -2480,7 +2481,8 @@ class ConvertTensorExtractSlice
         getSliceExtractionRelation(op.getSourceType(), op.getResultType(),
                                    SmallVector<int64_t>(op.getStaticOffsets()),
                                    SmallVector<int64_t>(op.getStaticSizes()),
-                                   SmallVector<int64_t>(op.getStaticStrides()));
+                                   SmallVector<int64_t>(op.getStaticStrides()),
+                                   op.getDroppedDims());
     if (failed(extractSliceLayout)) {
       return op.emitError() << "failed to get layout for extract slice";
     }
@@ -2510,7 +2512,7 @@ class ConvertTensorExtractSlice
 
     setMaterializedAttr(remapAndExtract);
     setAttributeAssociatedWith(remapAndExtract->getResult(0), kLayoutAttrName,
-                               sliceLayoutAttr);
+                               resultLayout);
     rewriter.replaceOp(op, remapAndExtract->getResult(0));
     return success();
   }

@@ -141,6 +141,7 @@
 #include "lib/Transforms/StraightLineVectorizer/StraightLineVectorizer.h"
 #include "lib/Transforms/TensorLinalgToAffineLoops/TensorLinalgToAffineLoops.h"
 #include "lib/Transforms/TensorToScalars/TensorToScalars.h"
+#include "lib/Transforms/TilePlanningMtpJkls/TilePlanningMtpJkls.h"
 #include "lib/Transforms/UnusedMemRef/UnusedMemRef.h"
 #include "lib/Transforms/ValidateNoise/ValidateNoise.h"
 #include "lib/Transforms/ValidateScale/ValidateScale.h"
@@ -433,6 +434,7 @@ int main(int argc, char** argv) {
   registerPolynomialApproximationPasses();
   registerPropagateAnnotationPasses();
   registerLayoutPropagationPasses();
+  registerTilePlanningMtpJklsPasses();
   registerLayoutOptimizationPasses();
   registerLinalgCanonicalizationsPasses();
   registerLinalgFuseLinearOpsPasses();

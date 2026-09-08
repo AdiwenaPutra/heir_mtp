@@ -63,6 +63,28 @@ cc_library(
 )
 
 cc_library(
+    name = "TilePlanningMtpJkls",
+    srcs = ["TilePlanningMtpJkls.cpp"],
+    hdrs = ["TilePlanningMtpJkls.h"],
+    deps = [
+        ":Utils",
+        "@heir//lib/Utils:MathUtils",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_test(
+    name = "TilePlanningMtpJklsTest",
+    srcs = ["TilePlanningMtpJklsTest.cpp"],
+    deps = [
+        ":TilePlanningMtpJkls",
+        ":Utils",
+        "@googletest//:gtest_main",
+        "@llvm-project//mlir:Support",
+    ],
+)
+
+cc_library(
     name = "Convolution",
     srcs = ["Convolution.cpp"],
     hdrs = ["Convolution.h"],

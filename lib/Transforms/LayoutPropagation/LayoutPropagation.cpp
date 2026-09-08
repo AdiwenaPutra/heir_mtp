@@ -27,6 +27,7 @@
 #include "lib/Utils/Layout/Hoisting.h"
 #include "lib/Utils/Layout/IslConversion.h"
 #include "lib/Utils/Layout/Utils.h"
+#include "llvm/include/llvm/ADT/DenseSet.h"                // from @llvm-project
 #include "llvm/include/llvm/ADT/STLExtras.h"               // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVector.h"             // from @llvm-project
 #include "llvm/include/llvm/ADT/SmallVectorExtras.h"       // from @llvm-project
@@ -159,24 +160,19 @@ struct MtpJklsAutoSelectionParams {
   int64_t tilesPerCiphertext;
 };
 
-// Ceiling division for known-positive operands, without computing
-// `value + divisor - 1` (which can overflow `int64_t` when `value` is near
-// its max). Mirrors `ceilDivPositive` in lib/Utils/Layout/Utils.cpp.
-int64_t ceilDivPositive(int64_t value, int64_t divisor) {
-  return 1 + (value - 1) / divisor;
-}
-
 // Returns the validated MTP-JKLS packing parameters for an eligible
 // unannotated secret-secret linalg.batch_matmul, or failure if the shapes do
 // not satisfy the eligibility contract: identical ranked, statically shaped
 // [batch, mu, mu] operands/result with a positive batch and mu, and a single
-// mu x mu tile fitting in one ciphertext. Never computes `mu * mu` before
-// establishing it cannot overflow relative to `minSlotCount`, and uses
-// `ceilDivPositive` rather than the `(a + b - 1) / b` idiom for both ceiling
-// divisions below. `ConvertLinalgBatchMatmul::mtpJklsKernel`'s paired
-// recovery of `tilesPerCiphertext` in ConvertToCiphertextSemantics.cpp reads
-// `batch` from the same logical operand type this function does, so it is
-// reachable with the same values and was fixed to use the same safe idiom.
+// mu x mu tile fitting in one ciphertext. The balanced-packing computation
+// itself (including its overflow-safe checks) is delegated to
+// `getBalancedMtpPacking`, the single shared source of truth also used by
+// Phase 8's outer-tiled GEMM tile planner, so both stay provably consistent
+// with each other and with `ConvertLinalgBatchMatmul::mtpJklsKernel`'s
+// independent recovery of `tilesPerCiphertext` in
+// ConvertToCiphertextSemantics.cpp — see the Phase 7 plan-review history for
+// why a second, independently-maintained copy of this formula previously
+// caused a real disagreement.
 FailureOr<MtpJklsAutoSelectionParams> getMtpJklsAutoSelectionParams(
     RankedTensorType lhsType, RankedTensorType rhsType,
     RankedTensorType resultType, int64_t minSlotCount) {
@@ -191,25 +187,17 @@ FailureOr<MtpJklsAutoSelectionParams> getMtpJklsAutoSelectionParams(
 
   int64_t batch = lhsType.getDimSize(0);
   int64_t mu = lhsType.getDimSize(1);
-  if (mu != lhsType.getDimSize(2) || batch <= 0 || mu <= 0 ||
-      minSlotCount <= 0) {
-    return failure();
-  }
-  // Overflow-safe check of `mu * mu <= minSlotCount`: avoids computing
-  // `mu * mu` unless it is already known not to exceed minSlotCount.
-  if (mu > minSlotCount / mu) {
+  if (mu != lhsType.getDimSize(2)) {
     return failure();
   }
 
-  int64_t slotsPerTile = mu * mu;
-  int64_t capacity = minSlotCount / slotsPerTile;
-  if (capacity <= 0) {
+  FailureOr<BalancedMtpPacking> packing =
+      getBalancedMtpPacking(batch, mu, mu, minSlotCount);
+  if (failed(packing)) {
     return failure();
   }
-  int64_t numCiphertexts = ceilDivPositive(batch, capacity);
-  int64_t tilesPerCiphertext = ceilDivPositive(batch, numCiphertexts);
 
-  return MtpJklsAutoSelectionParams{mu, tilesPerCiphertext};
+  return MtpJklsAutoSelectionParams{mu, packing->tilesPerCiphertext};
 }
 
 // The outcome of folding a zero `tensor.pad` on the spatial dims into a conv's
@@ -406,6 +394,17 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
   FailureOr<AssignLayoutOp> assignDefaultLayoutForOpOperand(
       Operation* op, Value operand, IRRewriter& builder);
 
+  // For a tensor.insert_slice into an authoritative destination (see
+  // authoritativeDestinations below), returns the physical layout the
+  // incoming slice (op.getSource()) must already have -- or be converted to
+  // -- so that inserting it at its actual static offsets, sizes, strides,
+  // and dropped dimensions reproduces exactly destLayout's fixed addressing.
+  // Returns failure for dynamic or non-unit-stride geometry, or any other
+  // case getSliceInsertionRelation cannot express, rather than guessing.
+  FailureOr<presburger::IntegerRelation>
+  getRequiredSliceLayoutForAuthoritativeDest(tensor::InsertSliceOp op,
+                                             LayoutAttr destLayout);
+
   // The conv/matvec kernels add the init (bias) operand directly to the
   // kernel output, which is packed per the op's result layout — for strided
   // convs a pixel-shuffled "gap" layout, NOT the row-major layout the init
@@ -443,6 +442,31 @@ struct LayoutPropagation : impl::LayoutPropagationBase<LayoutPropagation> {
 
   DenseMap<Value, Attribute> assignedLayouts;
   DataFlowSolver* solver;
+
+  // Layout-propagation's normal per-op handling treats a tensor.insert_slice
+  // destination's layout as negotiable: when the incoming slice and the
+  // destination disagree, the destination is unconditionally overridden to
+  // match the (single-slice-inferred) requirement. That is the correct
+  // policy for a family of inserts sharing a throwaway default destination
+  // layout (e.g. convolution/gap-insertion, assigned generically by
+  // assignDefaultLayoutForOpOperand and meant to be freely inferred), but
+  // wrong when the destination was deliberately, explicitly laid out before
+  // propagation began -- e.g. a Phase-8-style zero-seeded task batch seeded
+  // with its own tensor_ext.assign_layout -- and must stay fixed while the
+  // *incoming* slice is reconciled to it instead.
+  //
+  // This set identifies such authoritative destinations. It is populated
+  // once, in runOnOperation before the main walk mutates anything, with the
+  // results of every tensor_ext.assign_layout op already present in the
+  // input IR (deliberately excluding any assign_layout this pass itself
+  // synthesizes afterwards), and it grows in
+  // visitOperation(tensor::InsertSliceOp) to include the result of each
+  // insert chained onto an already-authoritative destination, so a sequence
+  // of sibling/chained inserts into the same logical destination all stay
+  // authoritative together. This is a small, bounded, pass-local notion of
+  // provenance -- not general layout provenance tracking -- and it cannot
+  // distinguish every kind of assignment a future pass might synthesize.
+  llvm::DenseSet<Value> authoritativeDestinations;
 };
 
 FailureOr<AssignLayoutOp> LayoutPropagation::assignDefaultLayoutForOpOperand(
@@ -1809,6 +1833,12 @@ LogicalResult LayoutPropagation::visitOperation(tensor::InsertSliceOp op) {
 
   Value result = op.getResult();
   assignedLayouts.insert({result, destLayout});
+  // Propagate destination authority forward: a chained insert into this
+  // result (e.g. a second sibling tile written into the same logical
+  // destination) must see it as authoritative too.
+  if (authoritativeDestinations.contains(op.getDest())) {
+    authoritativeDestinations.insert(result);
+  }
   debugAssignLayout(result, destLayout);
   setResultLayoutAttr(op, kernelInfoAttr);
   return success();
@@ -1921,7 +1951,8 @@ LogicalResult LayoutPropagation::visitOperation(tensor::ExtractSliceOp op) {
       getSliceExtractionRelation(op.getSourceType(), op.getResultType(),
                                  SmallVector<int64_t>(op.getStaticOffsets()),
                                  SmallVector<int64_t>(op.getStaticSizes()),
-                                 SmallVector<int64_t>(op.getStaticStrides()));
+                                 SmallVector<int64_t>(op.getStaticStrides()),
+                                 op.getDroppedDims());
   if (failed(maybeSliceExtractionLayout)) {
     return failure();
   }
@@ -2164,6 +2195,35 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
   return {true, std::nullopt};
 }
 
+FailureOr<presburger::IntegerRelation>
+LayoutPropagation::getRequiredSliceLayoutForAuthoritativeDest(
+    tensor::InsertSliceOp op, LayoutAttr destLayout) {
+  SmallVector<int64_t> offsets(op.getStaticOffsets());
+  SmallVector<int64_t> sizes(op.getStaticSizes());
+  SmallVector<int64_t> strides(op.getStaticStrides());
+  if (llvm::any_of(offsets, ShapedType::isDynamic) ||
+      llvm::any_of(sizes, ShapedType::isDynamic) ||
+      llvm::any_of(strides, ShapedType::isDynamic)) {
+    return failure();
+  }
+  // Only unit strides are supported: getSliceInsertionRelation accepts
+  // arbitrary strides algebraically, but no caller in this codebase has
+  // validated or tested non-unit-stride physical (ct, slot) reconciliation,
+  // and Phase 8's B2/B3/B6 fixtures never need it.
+  if (!llvm::all_of(strides, [](int64_t s) { return s == 1; })) {
+    return failure();
+  }
+  auto maybeInsertionRelation =
+      getSliceInsertionRelation(op.getSourceType(), op.getResultType(),
+                                offsets, sizes, strides, op.getDroppedDims());
+  if (failed(maybeInsertionRelation)) {
+    return failure();
+  }
+  IntegerRelation requiredSliceLayout = maybeInsertionRelation.value();
+  requiredSliceLayout.compose(destLayout.getIntegerRelation());
+  return requiredSliceLayout;
+}
+
 CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
     tensor::InsertSliceOp op) {
   // The arguments of a tensor::InsertSliceOp are the tensors to insert and the
@@ -2176,6 +2236,31 @@ CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
   }
   if (!assignedLayouts.contains(dest)) {
     return {false, op->emitError("destination tensor has no assigned layout")};
+  }
+
+  if (authoritativeDestinations.contains(dest)) {
+    // The destination's layout is authoritative and must never be
+    // overridden by this or any sibling/chained insert. Compatible iff the
+    // incoming slice, composed through its actual insertion geometry,
+    // already lands exactly on the destination's fixed addressing.
+    LayoutAttr destLayout = getComposedLayoutAttr(dest);
+    auto maybeRequiredSliceLayout =
+        getRequiredSliceLayoutForAuthoritativeDest(op, destLayout);
+    if (failed(maybeRequiredSliceLayout)) {
+      return {false,
+              op->emitError(
+                  "cannot reconcile tensor.insert_slice into an "
+                  "authoritative destination layout: unsupported dynamic "
+                  "offsets/sizes/strides, non-unit strides, or a dropped-"
+                  "dimension mask getSliceInsertionRelation cannot express")};
+    }
+    LayoutAttr insertLayout = getComposedLayoutAttr(insert);
+    if (LayoutAttr::getFromIntegerRelation(op.getContext(),
+                                           maybeRequiredSliceLayout.value()) !=
+        insertLayout) {
+      return {false, std::nullopt};
+    }
+    return {true, std::nullopt};
   }
 
   LayoutAttr insertLayout = getComposedLayoutAttr(insert);
@@ -2324,6 +2409,38 @@ void LayoutPropagation::rectifyIncompatibleOperandLayouts(ReduceOp op) {
 
 void LayoutPropagation::rectifyIncompatibleOperandLayouts(
     tensor::InsertSliceOp op) {
+  if (authoritativeDestinations.contains(op.getDest())) {
+    // The destination's layout is authoritative and must not change.
+    // hasCompatibleArgumentLayouts already established that a required
+    // slice layout is derivable here and that it disagrees with the
+    // incoming slice's current layout, so convert the *source* to match
+    // instead -- the opposite direction from the default policy below.
+    LayoutAttr destLayout = getComposedLayoutAttr(op.getDest());
+    auto maybeRequiredSliceLayout =
+        getRequiredSliceLayoutForAuthoritativeDest(op, destLayout);
+    assert(succeeded(maybeRequiredSliceLayout) &&
+           "hasCompatibleArgumentLayouts should already have rejected this "
+           "op with a diagnostic if the required slice layout could not be "
+           "derived");
+    LayoutAttr requiredLayoutAttr = LayoutAttr::getFromIntegerRelation(
+        op.getContext(), maybeRequiredSliceLayout.value());
+
+    mlir::IRRewriter builder(&getContext());
+    builder.setInsertionPoint(op);
+    LayoutAttr sourceLayout = getComposedLayoutAttr(op.getSource());
+    auto convertLayoutOp =
+        ConvertLayoutOp::create(builder, op->getLoc(), op.getSource(),
+                                sourceLayout, requiredLayoutAttr);
+    Value toReplace = convertLayoutOp.getResult();
+    builder.replaceUsesWithIf(op.getSource(), toReplace,
+                              [&](OpOperand& operand) {
+                                return operand.getOwner() == op;
+                              });
+    assignedLayouts.insert({toReplace, requiredLayoutAttr});
+    setResultLayoutAttr(convertLayoutOp);
+    return;
+  }
+
   // Update the dest tensor to align with the source tensor slice.
   LayoutAttr sliceLayout = getComposedLayoutAttr(op.getSource());
   auto maybeNewLayout = pushSliceLayoutThroughInsertSlice(
@@ -2478,6 +2595,15 @@ void LayoutPropagation::setResultLayoutAttr(Operation* op,
 }
 
 void LayoutPropagation::runOnOperation() {
+  // Snapshot which values are the result of a tensor_ext.assign_layout op
+  // already present in the input IR, before the main walk below mutates
+  // anything (in particular, before assignDefaultLayoutForOpOperand
+  // synthesizes any of its own assign_layout ops, which must NOT be treated
+  // as an authoritative, must-preserve destination layout).
+  getOperation()->walk([&](AssignLayoutOp op) {
+    authoritativeDestinations.insert(op.getResult());
+  });
+
   DataFlowSolver solver;
   dataflow::loadBaselineAnalyses(solver);
   solver.load<SecretnessAnalysis>();

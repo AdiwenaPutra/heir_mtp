@@ -29,6 +29,13 @@ inline uint64_t nextPowerOfTwo(uint64_t v) {
 
 inline bool isPowerOfTwo(int64_t n) { return (n > 0) && ((n & (n - 1)) == 0); }
 
+// Ceiling division for known-positive `value` and `divisor`, without
+// computing `value + divisor - 1` (which can overflow `int64_t` when `value`
+// is near its max). Caller must ensure `value > 0` and `divisor > 0`.
+inline int64_t ceilDivPositive(int64_t value, int64_t divisor) {
+  return 1 + (value - 1) / divisor;
+}
+
 // Convert an input APFloat to the given semantics
 APFloat convertFloatToSemantics(APFloat value,
                                 const llvm::fltSemantics& semantics);

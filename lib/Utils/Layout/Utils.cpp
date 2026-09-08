@@ -469,6 +469,30 @@ presburger::IntegerRelation getTricyclicLayoutRelation(
   return result;
 }
 
+FailureOr<BalancedMtpPacking> getBalancedMtpPacking(int64_t taskCount,
+                                                    int64_t tileRows,
+                                                    int64_t tileColumns,
+                                                    int64_t minSlotCount) {
+  if (taskCount <= 0 || tileRows <= 0 || tileColumns <= 0 ||
+      minSlotCount <= 0) {
+    return failure();
+  }
+  // Overflow-safe check of `tileRows * tileColumns <= minSlotCount`: avoids
+  // computing `tileRows * tileColumns` unless it is already known not to
+  // exceed minSlotCount.
+  if (tileRows > minSlotCount / tileColumns) {
+    return failure();
+  }
+  int64_t slotsPerTile = tileRows * tileColumns;
+  int64_t capacity = minSlotCount / slotsPerTile;
+  if (capacity <= 0) {
+    return failure();
+  }
+  int64_t numCiphertexts = ceilDivPositive(taskCount, capacity);
+  int64_t tilesPerCiphertext = ceilDivPositive(taskCount, numCiphertexts);
+  return BalancedMtpPacking{numCiphertexts, tilesPerCiphertext};
+}
+
 FailureOr<presburger::IntegerRelation> getMultiTileLayoutRelation(
     RankedTensorType tensorType, int64_t rowAxis, int64_t columnAxis,
     int64_t tileRows, int64_t tileColumns, int64_t tilesPerCiphertext,
@@ -1334,7 +1358,15 @@ presburger::IntegerRelation getCollapsedRelation(
 FailureOr<presburger::IntegerRelation> getSliceInsertionRelation(
     RankedTensorType sliceType, RankedTensorType resultType,
     SmallVector<int64_t> offsets, SmallVector<int64_t> sizes,
-    SmallVector<int64_t> strides) {
+    SmallVector<int64_t> strides, const llvm::SmallBitVector& droppedDims) {
+  if (static_cast<int64_t>(droppedDims.size()) != resultType.getRank()) {
+    return failure();
+  }
+  if (resultType.getRank() - static_cast<int64_t>(droppedDims.count()) !=
+      sliceType.getRank()) {
+    return failure();
+  }
+
   IntegerRelation result(PresburgerSpace::getRelationSpace(
       sliceType.getRank(), /*numRange=*/resultType.getRank(), /*numSymbol=*/0,
       /*numLocals=*/0));
@@ -1358,12 +1390,15 @@ FailureOr<presburger::IntegerRelation> getSliceInsertionRelation(
   }
 
   // Source tensor's dimensions (d0, d1, ...) are mapped sequentially to the
-  // destination tensor's dimensions (r0, r1, ...) for which the slice size is
-  // greater than 1.
+  // destination tensor's dimensions (r0, r1, ...) that droppedDims does not
+  // mark as dropped. A destination dimension of size 1 is not necessarily
+  // dropped -- droppedDims (typically the inserting op's own
+  // getDroppedDims()) disambiguates a retained unit dimension from a
+  // rank-reduced one, which `sizes[destDim] > 1` alone cannot.
   auto constOffset = result.getNumCols() - 1;
   unsigned int sourceDim = 0;
   for (auto destDim = 0; destDim < resultType.getRank(); ++destDim) {
-    if (sizes[destDim] > 1) {
+    if (!droppedDims[destDim]) {
       // Map from the i-th source dimension
       // r_j = offsets[j] + d_i * strides[j]
       addConstraint(result,
@@ -1443,7 +1478,15 @@ presburger::IntegerRelation getPaddingRelation(RankedTensorType paddedType,
 FailureOr<presburger::IntegerRelation> getSliceExtractionRelation(
     RankedTensorType sourceType, RankedTensorType resultType,
     SmallVector<int64_t> offsets, SmallVector<int64_t> sizes,
-    SmallVector<int64_t> strides) {
+    SmallVector<int64_t> strides, const llvm::SmallBitVector& droppedDims) {
+  if (static_cast<int64_t>(droppedDims.size()) != sourceType.getRank()) {
+    return failure();
+  }
+  if (sourceType.getRank() - static_cast<int64_t>(droppedDims.count()) !=
+      resultType.getRank()) {
+    return failure();
+  }
+
   IntegerRelation result(PresburgerSpace::getRelationSpace(
       sourceType.getRank(), /*numRange=*/resultType.getRank(),
       /*numSymbol=*/0,
@@ -1462,12 +1505,17 @@ FailureOr<presburger::IntegerRelation> getSliceExtractionRelation(
   }
 
   // Destination tensor's dimensions (d0, d1, ...) are mapped sequentially
-  // from the source tensor's dimensions (r0, r1, ...) for which the slice
-  // size is greater than 1.
+  // from the source tensor's dimensions (r0, r1, ...) that droppedDims does
+  // not mark as dropped. A source dimension of size 1 is not necessarily
+  // dropped -- droppedDims (typically the extracting op's own
+  // getDroppedDims()) disambiguates a retained unit dimension from a
+  // rank-reduced one, which `sizes[sourceDim] > 1` alone cannot: both a
+  // rank-preserving extraction (result also has a unit dim there) and a
+  // rank-reducing one produce the same `sizes` entry.
   auto constOffset = result.getNumCols() - 1;
   unsigned int resultDim = 0;
   for (auto sourceDim = 0; sourceDim < sourceType.getRank(); ++sourceDim) {
-    if (sizes[sourceDim] > 1) {
+    if (!droppedDims[sourceDim]) {
       // Map to the i-th result dimension
       // d_j = offsets[j] + r_i * strides[j]
       addConstraint(result,

@@ -6,6 +6,7 @@
 #include <utility>
 #include <vector>
 
+#include "llvm/include/llvm/ADT/SmallBitVector.h"  // from @llvm-project
 #include "mlir/include/mlir/Analysis/Presburger/IntegerRelation.h"  // from @llvm-project
 #include "mlir/include/mlir/Analysis/Presburger/PresburgerSpace.h"  // from @llvm-project
 #include "mlir/include/mlir/Dialect/Arith/Utils/Utils.h"  // from @llvm-project
@@ -278,10 +279,21 @@ presburger::IntegerRelation getCollapsedRelation(
     ArrayRef<ReassociationIndices> reassociation);
 
 // Get layout relation that corresponds to a tensor::insert_slice op.
+//
+// `droppedDims` must be indexed over `resultType`'s rank (i.e. one bit per
+// destination dimension, matching `tensor::InsertSliceOp::getDroppedDims()`)
+// and identify which destination dimensions do not correspond to a dimension
+// of `sliceType`. A destination dimension of static size 1 is not always
+// dropped: it is retained when `sliceType` also has a corresponding
+// dimension there (a rank-preserving insertion), so this cannot be inferred
+// from `sizes` alone -- the caller must supply the real answer, typically via
+// the inserting op's own `getDroppedDims()`. Returns failure if
+// `droppedDims`'s size does not match `resultType`'s rank, or if the number
+// of retained (non-dropped) dimensions does not match `sliceType`'s rank.
 FailureOr<presburger::IntegerRelation> getSliceInsertionRelation(
     RankedTensorType sliceType, RankedTensorType resultType,
     SmallVector<int64_t> offsets, SmallVector<int64_t> sizes,
-    SmallVector<int64_t> strides);
+    SmallVector<int64_t> strides, const llvm::SmallBitVector& droppedDims);
 
 // Shift a var at pos by a constant offset in an IntegerRelation, i.e. replace
 // var with var' = var + offset.
@@ -295,10 +307,51 @@ presburger::IntegerRelation getPaddingRelation(RankedTensorType paddedType,
                                                ArrayRef<int64_t> lowPadding);
 
 // Get layout relation that corresponds to a tensor::extract_slice op.
+//
+// `droppedDims` must be indexed over `sourceType`'s rank (i.e. one bit per
+// source dimension, matching `tensor::ExtractSliceOp::getDroppedDims()`) and
+// identify which source dimensions do not survive into `resultType`. A
+// source dimension of static size 1 is not always dropped: it is retained
+// when `resultType` also has a corresponding dimension there (a
+// rank-preserving extraction), so this cannot be inferred from `sizes`
+// alone -- the caller must supply the real answer, typically via the
+// extracting op's own `getDroppedDims()`. Returns failure if
+// `droppedDims`'s size does not match `sourceType`'s rank, or if the number
+// of retained (non-dropped) dimensions does not match `resultType`'s rank.
 FailureOr<presburger::IntegerRelation> getSliceExtractionRelation(
     RankedTensorType sourceType, RankedTensorType resultType,
     SmallVector<int64_t> offsets, SmallVector<int64_t> sizes,
-    SmallVector<int64_t> strides);
+    SmallVector<int64_t> strides, const llvm::SmallBitVector& droppedDims);
+
+// Returns the balanced multi-tile packing parameters for `taskCount`
+// primitive tiles of shape `tileRows x tileColumns`, given `minSlotCount`
+// slots per ciphertext:
+//
+//   capacity           = floor(minSlotCount / (tileRows*tileColumns))
+//   numCiphertexts     = ceil(taskCount / capacity)
+//   tilesPerCiphertext = ceil(taskCount / numCiphertexts)
+//
+// This is the single source of truth for the balanced-packing formula that
+// both automatic MTP-JKLS batch-matmul selection and general outer-tiled
+// GEMM tile scheduling rely on. `tilesPerCiphertext` is defined so that it
+// always agrees with the value `ConvertLinalgBatchMatmul::mtpJklsKernel`
+// independently recovers from the physical shape
+// (`ceil(taskCount / numCiphertexts)`), which is what makes this "balanced"
+// rather than a maximum-fill policy -- see the Phase 7 plan-review history
+// for the disagreement a maximum-fill formula can produce.
+//
+// Returns failure for non-positive inputs, for a primitive tile that does
+// not fit in one ciphertext, or if any intermediate arithmetic would
+// overflow.
+struct BalancedMtpPacking {
+  int64_t numCiphertexts;
+  int64_t tilesPerCiphertext;
+};
+
+FailureOr<BalancedMtpPacking> getBalancedMtpPacking(int64_t taskCount,
+                                                    int64_t tileRows,
+                                                    int64_t tileColumns,
+                                                    int64_t minSlotCount);
 
 // Tests whether two layout relations describe the same set of points.
 //

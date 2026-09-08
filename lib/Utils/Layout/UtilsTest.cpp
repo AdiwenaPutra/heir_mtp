@@ -1095,7 +1095,10 @@ TEST(UtilsTest, TestCollapseDimensionsMultipleUnitDimsInGroup) {
 
 TEST(UtilsTest, TestGetSliceInsertionRelation) {
   MLIRContext context;
-  // Insert a 3x4 slice into a 2x1x3x4 matrix at (1, 0, 0, 0).
+  // Insert a 3x4 slice into a 2x1x3x4 matrix at (1, 0, 0, 0). Dest dims 0 and
+  // 1 (both static size 1... only dim 1 is; dim 0 has size 2) are dropped:
+  // dim 0 has size 2 (not droppable) and dim 1 has static size 1 and is
+  // rank-reduced away (sliceType has no corresponding dim for it).
   RankedTensorType sliceType =
       RankedTensorType::get({3, 4}, IndexType::get(&context));
   RankedTensorType destType =
@@ -1103,9 +1106,12 @@ TEST(UtilsTest, TestGetSliceInsertionRelation) {
   SmallVector<int64_t> offsets = {1, 0, 0, 0};
   SmallVector<int64_t> sizes = {1, 1, 3, 4};
   SmallVector<int64_t> strides = {1, 1, 1, 1};
+  llvm::SmallBitVector droppedDims(4);
+  droppedDims.set(0);
+  droppedDims.set(1);
 
-  auto sliceRelation =
-      getSliceInsertionRelation(sliceType, destType, offsets, sizes, strides);
+  auto sliceRelation = getSliceInsertionRelation(sliceType, destType, offsets,
+                                                 sizes, strides, droppedDims);
   ASSERT_TRUE(succeeded(sliceRelation));
 
   // Expect two ciphertexts.
@@ -1123,6 +1129,96 @@ TEST(UtilsTest, TestGetSliceInsertionRelation) {
     auto maybeExists = sliceRelation.value().containsPointNoLocal(point);
     EXPECT_TRUE(maybeExists.has_value());
   }
+}
+
+// Regression for a real bug (found in Phase 8 design review, round 2):
+// `sizes[dim] > 1` cannot distinguish a retained (rank-preserving) unit
+// dimension from a rank-reduced one, because both produce the same `sizes`
+// entry. This inserts a rank-preserving 1x4 slice (not a rank-reducing 4)
+// into a 3x4 dest, so no destination dimension is dropped at all.
+TEST(UtilsTest, TestGetSliceInsertionRelationRetainedUnitDim) {
+  MLIRContext context;
+  RankedTensorType sliceType =
+      RankedTensorType::get({1, 4}, IndexType::get(&context));
+  RankedTensorType destType =
+      RankedTensorType::get({3, 4}, IndexType::get(&context));
+  SmallVector<int64_t> offsets = {1, 0};
+  SmallVector<int64_t> sizes = {1, 4};
+  SmallVector<int64_t> strides = {1, 1};
+  llvm::SmallBitVector droppedDims(2);  // Nothing dropped: rank-preserving.
+
+  auto sliceRelation = getSliceInsertionRelation(sliceType, destType, offsets,
+                                                 sizes, strides, droppedDims);
+  ASSERT_TRUE(succeeded(sliceRelation));
+
+  // Both destination dimensions must be constrained: dim 0 fixed at the
+  // retained unit slice position (row 1), dim 1 mapped from the slice.
+  std::vector<std::vector<int64_t>> expectedPoints = {
+      {0, 0, 1, 0}, {0, 3, 1, 3},
+  };
+  for (const auto& point : expectedPoints) {
+    EXPECT_TRUE(sliceRelation.value().containsPointNoLocal(point).has_value());
+  }
+  // Row 0 and row 2 of the dest must NOT be reachable from this slice.
+  EXPECT_FALSE(sliceRelation.value().containsPointNoLocal({0, 0, 0, 0}).has_value());
+  EXPECT_FALSE(sliceRelation.value().containsPointNoLocal({0, 0, 2, 0}).has_value());
+}
+
+// Regression for the same bug, with multiple ambiguous size-1 dimensions:
+// dims 0 and 1 both have static size 1 in the offsets/sizes list, but only
+// dim 1 is actually dropped (rank-reduced); dim 2 (also size 1) is retained
+// because the dest's rank-2 declared shape needs it. `sizes[dim] > 1` alone
+// cannot tell these apart; only explicit droppedDims can.
+TEST(UtilsTest, TestGetSliceInsertionRelationAmbiguousRankReduction) {
+  MLIRContext context;
+  RankedTensorType sliceType =
+      RankedTensorType::get({1, 4}, IndexType::get(&context));
+  RankedTensorType destType =
+      RankedTensorType::get({2, 1, 1, 4}, IndexType::get(&context));
+  SmallVector<int64_t> offsets = {1, 0, 0, 0};
+  SmallVector<int64_t> sizes = {1, 1, 1, 4};
+  SmallVector<int64_t> strides = {1, 1, 1, 1};
+  llvm::SmallBitVector droppedDims(4);
+  droppedDims.set(0);
+  droppedDims.set(1);
+  // dim 2 (index 2) is retained; dim 3 is retained.
+
+  auto sliceRelation = getSliceInsertionRelation(sliceType, destType, offsets,
+                                                 sizes, strides, droppedDims);
+  ASSERT_TRUE(succeeded(sliceRelation));
+
+  std::vector<std::vector<int64_t>> expectedPoints = {
+      {0, 0, 1, 0, 0, 0}, {0, 3, 1, 0, 0, 3},
+  };
+  for (const auto& point : expectedPoints) {
+    EXPECT_TRUE(sliceRelation.value().containsPointNoLocal(point).has_value());
+  }
+}
+
+TEST(UtilsTest, TestGetSliceInsertionRelationInvalidDroppedDimsSize) {
+  MLIRContext context;
+  RankedTensorType sliceType =
+      RankedTensorType::get({4}, IndexType::get(&context));
+  RankedTensorType destType =
+      RankedTensorType::get({3, 4}, IndexType::get(&context));
+  llvm::SmallBitVector wrongSizeDroppedDims(3);  // Should be 2 (destType rank).
+  auto sliceRelation = getSliceInsertionRelation(
+      sliceType, destType, {1, 0}, {1, 4}, {1, 1}, wrongSizeDroppedDims);
+  EXPECT_TRUE(failed(sliceRelation));
+}
+
+TEST(UtilsTest, TestGetSliceInsertionRelationInconsistentDroppedDimsCount) {
+  MLIRContext context;
+  RankedTensorType sliceType =
+      RankedTensorType::get({4}, IndexType::get(&context));
+  RankedTensorType destType =
+      RankedTensorType::get({3, 4}, IndexType::get(&context));
+  // Claims nothing is dropped, but sliceType (rank 1) has fewer dims than
+  // destType (rank 2), so this contract is inconsistent.
+  llvm::SmallBitVector inconsistentDroppedDims(2);
+  auto sliceRelation = getSliceInsertionRelation(
+      sliceType, destType, {1, 0}, {1, 4}, {1, 1}, inconsistentDroppedDims);
+  EXPECT_TRUE(failed(sliceRelation));
 }
 
 TEST(UtilsTest, TestShiftVar) {
@@ -1159,7 +1255,10 @@ TEST(UtilsTest, TestShiftVarRangeOffset) {
 
 TEST(UtilsTest, TestGetSliceExtractionRelation) {
   MLIRContext context;
-  // Extract a 3x4 slice from a 2x1x3x4 matrix at (1, 0, 0, 0).
+  // Extract a 3x4 slice from a 2x1x3x4 matrix at (1, 0, 0, 0). Source dims 0
+  // and 1 are dropped (dim 0 has size 2 and is a non-unit extracted-away
+  // dim's offset fixed point at this slice; dim 1 has static size 1 and is
+  // rank-reduced away).
   RankedTensorType sourceType =
       RankedTensorType::get({2, 1, 3, 4}, IndexType::get(&context));
   RankedTensorType sliceType =
@@ -1167,9 +1266,13 @@ TEST(UtilsTest, TestGetSliceExtractionRelation) {
   SmallVector<int64_t> offsets = {1, 0, 0, 0};
   SmallVector<int64_t> sizes = {1, 1, 3, 4};
   SmallVector<int64_t> strides = {1, 1, 1, 1};
+  llvm::SmallBitVector droppedDims(4);
+  droppedDims.set(0);
+  droppedDims.set(1);
 
   auto sliceRelation = getSliceExtractionRelation(sourceType, sliceType,
-                                                  offsets, sizes, strides);
+                                                  offsets, sizes, strides,
+                                                  droppedDims);
   ASSERT_TRUE(succeeded(sliceRelation));
 
   // Test a few points.
@@ -1183,6 +1286,103 @@ TEST(UtilsTest, TestGetSliceExtractionRelation) {
     auto maybeExists = sliceRelation.value().containsPointNoLocal(point);
     EXPECT_TRUE(maybeExists.has_value());
   }
+}
+
+// Regression for a real bug (found in Phase 8 design review, round 2):
+// `sizes[dim] > 1` cannot distinguish a retained (rank-preserving) unit
+// dimension from a rank-reduced one, because both produce the same `sizes`
+// entry. This extracts a rank-preserving 1x4 slice (not a rank-reducing 4)
+// from a 3x4 source, so no source dimension is dropped at all.
+TEST(UtilsTest, TestGetSliceExtractionRelationRetainedUnitDim) {
+  MLIRContext context;
+  RankedTensorType sourceType =
+      RankedTensorType::get({3, 4}, IndexType::get(&context));
+  RankedTensorType sliceType =
+      RankedTensorType::get({1, 4}, IndexType::get(&context));
+  SmallVector<int64_t> offsets = {1, 0};
+  SmallVector<int64_t> sizes = {1, 4};
+  SmallVector<int64_t> strides = {1, 1};
+  llvm::SmallBitVector droppedDims(2);  // Nothing dropped: rank-preserving.
+
+  auto sliceRelation = getSliceExtractionRelation(
+      sourceType, sliceType, offsets, sizes, strides, droppedDims);
+  ASSERT_TRUE(succeeded(sliceRelation));
+
+  // Both slice dimensions must be constrained: dim 0 requires source row 1,
+  // dim 1 is mapped from the source column.
+  std::vector<std::vector<int64_t>> expectedPoints = {
+      {1, 0, 0, 0}, {1, 3, 0, 3},
+  };
+  for (const auto& point : expectedPoints) {
+    EXPECT_TRUE(sliceRelation.value().containsPointNoLocal(point).has_value());
+  }
+  // Source rows 0 and 2 must not satisfy this slice's constraints.
+  EXPECT_FALSE(sliceRelation.value().containsPointNoLocal({0, 0, 0, 0}).has_value());
+  EXPECT_FALSE(sliceRelation.value().containsPointNoLocal({2, 0, 0, 0}).has_value());
+}
+
+// Regression for the same bug, with multiple ambiguous size-1 dimensions:
+// dims 0, 1, and 2 of the offsets/sizes list are all size 1 (this extraction
+// takes exactly one position along each), but only dims 1 and 2 are actually
+// dropped (rank-reduced); dim 0 is retained as a genuine size-1 dimension of
+// the declared rank-2 slice type. The naive `sizes[dim] > 1` heuristic would
+// see only dim 3 (size 4) as retained and treat dims 0-2 as all dropped,
+// which mismatches the declared rank-2 result and leaves one of its
+// dimensions completely unconstrained -- only explicit droppedDims avoids
+// that.
+TEST(UtilsTest, TestGetSliceExtractionRelationAmbiguousRankReduction) {
+  MLIRContext context;
+  RankedTensorType sourceType =
+      RankedTensorType::get({2, 1, 1, 4}, IndexType::get(&context));
+  RankedTensorType sliceType =
+      RankedTensorType::get({1, 4}, IndexType::get(&context));
+  SmallVector<int64_t> offsets = {1, 0, 0, 0};
+  SmallVector<int64_t> sizes = {1, 1, 1, 4};
+  SmallVector<int64_t> strides = {1, 1, 1, 1};
+  llvm::SmallBitVector droppedDims(4);
+  // dim 0 (index 0) and dim 3 are retained; dims 1 and 2 are dropped.
+  droppedDims.set(1);
+  droppedDims.set(2);
+
+  auto sliceRelation = getSliceExtractionRelation(
+      sourceType, sliceType, offsets, sizes, strides, droppedDims);
+  ASSERT_TRUE(succeeded(sliceRelation));
+
+  // Point order is (source d0,d1,d2,d3, slice r0,r1).
+  std::vector<std::vector<int64_t>> expectedPoints = {
+      {1, 0, 0, 0, 0, 0}, {1, 0, 0, 3, 0, 3},
+  };
+  for (const auto& point : expectedPoints) {
+    EXPECT_TRUE(sliceRelation.value().containsPointNoLocal(point).has_value());
+  }
+  // Source dim 0 = 0 must not satisfy this slice (retained dim 0 requires
+  // the fixed offset row 1, not any row).
+  EXPECT_FALSE(
+      sliceRelation.value().containsPointNoLocal({0, 0, 0, 0, 0, 0}).has_value());
+}
+
+TEST(UtilsTest, TestGetSliceExtractionRelationInvalidDroppedDimsSize) {
+  MLIRContext context;
+  RankedTensorType sourceType =
+      RankedTensorType::get({3, 4}, IndexType::get(&context));
+  RankedTensorType sliceType = RankedTensorType::get({4}, IndexType::get(&context));
+  llvm::SmallBitVector wrongSizeDroppedDims(3);  // Should be 2 (sourceType rank).
+  auto sliceRelation = getSliceExtractionRelation(
+      sourceType, sliceType, {1, 0}, {1, 4}, {1, 1}, wrongSizeDroppedDims);
+  EXPECT_TRUE(failed(sliceRelation));
+}
+
+TEST(UtilsTest, TestGetSliceExtractionRelationInconsistentDroppedDimsCount) {
+  MLIRContext context;
+  RankedTensorType sourceType =
+      RankedTensorType::get({3, 4}, IndexType::get(&context));
+  RankedTensorType sliceType = RankedTensorType::get({4}, IndexType::get(&context));
+  // Claims nothing is dropped, but sliceType (rank 1) has fewer dims than
+  // sourceType (rank 2), so this contract is inconsistent.
+  llvm::SmallBitVector inconsistentDroppedDims(2);
+  auto sliceRelation = getSliceExtractionRelation(
+      sourceType, sliceType, {1, 0}, {1, 4}, {1, 1}, inconsistentDroppedDims);
+  EXPECT_TRUE(failed(sliceRelation));
 }
 
 TEST(UtilsTest, TestGetCtComplementPoints) {
@@ -1399,6 +1599,71 @@ TEST(UtilsTest, TestGetPaddingRelation) {
   EXPECT_FALSE(rel.containsPointNoLocal({7, 5}).has_value());
   // p = 1 => s = -1, out of bounds
   EXPECT_FALSE(rel.containsPointNoLocal({1, -1}).has_value());
+}
+
+// Known-value regression: mu=2, minSlotCount=22 (capacity=5), taskCount=11.
+// The original (rejected) maximum-fill formula picked tilesPerCiphertext=5,
+// which disagreed with the materializer's independent recovery of 4 -- see
+// the Phase 7 plan-review history. The balanced formula must agree with the
+// materializer by construction.
+TEST(UtilsTest, TestGetBalancedMtpPackingKnownDisagreementCase) {
+  auto packing = getBalancedMtpPacking(/*taskCount=*/11, /*tileRows=*/2,
+                                       /*tileColumns=*/2, /*minSlotCount=*/22);
+  ASSERT_TRUE(succeeded(packing));
+  EXPECT_EQ(packing->numCiphertexts, 3);
+  EXPECT_EQ(packing->tilesPerCiphertext, 4);
+}
+
+// A second known-value case (mu=2, minSlotCount=20, capacity=5,
+// taskCount=7) from the same Phase 7 history: the disagreement regression
+// that specifically distinguishes the two formulas ([7,2,2] at 20 slots).
+TEST(UtilsTest, TestGetBalancedMtpPackingSevenTwoTwo) {
+  auto packing = getBalancedMtpPacking(/*taskCount=*/7, /*tileRows=*/2,
+                                       /*tileColumns=*/2, /*minSlotCount=*/20);
+  ASSERT_TRUE(succeeded(packing));
+  EXPECT_EQ(packing->numCiphertexts, 2);
+  EXPECT_EQ(packing->tilesPerCiphertext, 4);
+}
+
+// An evenly-divisible case: everything should fit in exactly one ciphertext.
+TEST(UtilsTest, TestGetBalancedMtpPackingEvenlyDivisible) {
+  auto packing = getBalancedMtpPacking(/*taskCount=*/4, /*tileRows=*/2,
+                                       /*tileColumns=*/2, /*minSlotCount=*/16);
+  ASSERT_TRUE(succeeded(packing));
+  EXPECT_EQ(packing->numCiphertexts, 1);
+  EXPECT_EQ(packing->tilesPerCiphertext, 4);
+}
+
+// Rectangular (non-square) primitive tiles, exercising generality beyond the
+// square mu x mu case MTP-JKLS currently uses.
+TEST(UtilsTest, TestGetBalancedMtpPackingRectangularTile) {
+  // slotsPerTile = 6, capacity = floor(100/6) = 16, taskCount = 20.
+  auto packing = getBalancedMtpPacking(/*taskCount=*/20, /*tileRows=*/2,
+                                       /*tileColumns=*/3,
+                                       /*minSlotCount=*/100);
+  ASSERT_TRUE(succeeded(packing));
+  EXPECT_EQ(packing->numCiphertexts, 2);
+  EXPECT_EQ(packing->tilesPerCiphertext, 10);
+}
+
+TEST(UtilsTest, TestGetBalancedMtpPackingRejectsNonPositiveInputs) {
+  EXPECT_TRUE(failed(getBalancedMtpPacking(0, 2, 2, 100)));
+  EXPECT_TRUE(failed(getBalancedMtpPacking(-1, 2, 2, 100)));
+  EXPECT_TRUE(failed(getBalancedMtpPacking(4, 0, 2, 100)));
+  EXPECT_TRUE(failed(getBalancedMtpPacking(4, 2, -1, 100)));
+  EXPECT_TRUE(failed(getBalancedMtpPacking(4, 2, 2, 0)));
+}
+
+TEST(UtilsTest, TestGetBalancedMtpPackingRejectsTileTooLarge) {
+  // A single 4x4 tile (16 slots) does not fit in an 8-slot ciphertext.
+  EXPECT_TRUE(failed(getBalancedMtpPacking(1, 4, 4, 8)));
+}
+
+TEST(UtilsTest, TestGetBalancedMtpPackingRejectsOverflowingTileSize) {
+  // tileRows*tileColumns would overflow int64_t; must be rejected via the
+  // overflow-safe check rather than wrapping.
+  constexpr int64_t kHuge = (int64_t{1} << 40);
+  EXPECT_TRUE(failed(getBalancedMtpPacking(1, kHuge, kHuge, 100)));
 }
 
 }  // namespace

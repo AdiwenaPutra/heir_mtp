@@ -63,7 +63,8 @@ FailureOr<OpFoldResult> ForwardSingleInsertSliceToExtractSlice::getValueAtSlice(
                 insertSliceType, insertDestType,
                 SmallVector<int64_t>(insertOp.getStaticOffsets()),
                 SmallVector<int64_t>(insertOp.getStaticSizes()),
-                SmallVector<int64_t>(insertOp.getStaticStrides()));
+                SmallVector<int64_t>(insertOp.getStaticStrides()),
+                insertOp.getDroppedDims());
             if (failed(insertRel))
               return rewriter.notifyMatchFailure(
                   originalExtractOp,
@@ -77,7 +78,8 @@ FailureOr<OpFoldResult> ForwardSingleInsertSliceToExtractSlice::getValueAtSlice(
                 extractResultType, extractSourceType,
                 SmallVector<int64_t>(originalExtractOp.getStaticOffsets()),
                 SmallVector<int64_t>(originalExtractOp.getStaticSizes()),
-                SmallVector<int64_t>(originalExtractOp.getStaticStrides()));
+                SmallVector<int64_t>(originalExtractOp.getStaticStrides()),
+                originalExtractOp.getDroppedDims());
             if (failed(extractRel))
               return rewriter.notifyMatchFailure(
                   originalExtractOp,

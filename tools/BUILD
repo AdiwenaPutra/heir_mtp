@@ -183,6 +183,7 @@ cc_binary(
         "@heir//lib/Transforms/StraightLineVectorizer",
         "@heir//lib/Transforms/TensorLinalgToAffineLoops",
         "@heir//lib/Transforms/TensorToScalars",
+        "@heir//lib/Transforms/TilePlanningMtpJkls",
         "@heir//lib/Transforms/UnusedMemRef",
         "@heir//lib/Transforms/ValidateNoise",
         "@heir//lib/Transforms/ValidateScale",
