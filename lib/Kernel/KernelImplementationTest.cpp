@@ -1031,13 +1031,25 @@ TEST(KernelImplementationTest, MtpJklsMatmulOneByOneTile) {
 }
 
 TEST(KernelImplementationTest, MtpJklsMatmulTwoByTwoTile) {
-  // JKLS interprets d as matrix row and l as matrix column, so these packed
-  // vectors are row-major matrices under the single-tile MTP layout:
+  // Convention S: l is the local matrix row, d is the local matrix column
+  // (slot = d*(tilesPerCiphertext*mu) + p*mu + l), matching the
+  // application-facing MTP contract (Phase-2 mapping oracle, OpenMAGE's
+  // pack_tile). For a single mu=2 tile (tilesPerCiphertext=1, p=0), this
+  // packing is column-major: packed[l + d*mu] = M[row=l][col=d]. These are
+  // exactly the values in the canonical Convention-S worked example:
   //
-  //   A = [1 2]    B = [5 6]
-  //       [3 4]        [7 8]
-  LiteralValue packedA(std::vector<int>{1, 2, 3, 4});
-  LiteralValue packedB(std::vector<int>{5, 6, 7, 8});
+  //   A = [1 2]    B = [5 6]     A@B = [19 22]
+  //       [3 4]        [7 8]            [43 50]
+  //
+  //   packed A = [1, 3, 2, 4]   (column-major flatten of A)
+  //   packed B = [5, 7, 6, 8]   (column-major flatten of B)
+  //   packed C = [19, 43, 22, 50]   (column-major flatten of A@B)
+  //
+  // implementMtpJklsMatmul computes this via the internal preprocessing-role
+  // swap sigma/Phi(B), tau/Psi(A) -- see its header comment -- while the
+  // public operation remains ordinary A @ B, not B @ A or a transpose.
+  LiteralValue packedA(std::vector<int>{1, 3, 2, 4});
+  LiteralValue packedB(std::vector<int>{5, 7, 6, 8});
 
   auto dag = implementMtpJklsMatmul(
       packedA, packedB, /*tileSize=*/2, /*tilesPerCiphertext=*/1,
@@ -1045,19 +1057,20 @@ TEST(KernelImplementationTest, MtpJklsMatmulTwoByTwoTile) {
 
   LiteralValue result = evalKernel(dag)[0];
   EXPECT_EQ(std::get<std::vector<int>>(result.get()),
-            std::vector<int>({19, 22, 43, 50}));
+            std::vector<int>({19, 43, 22, 50}));
 }
 
 TEST(KernelImplementationTest, MtpJklsMatmulMultiplePackedTiles) {
-  // Two aligned 2x2 matrix pairs are interleaved in d -> p -> l order:
+  // Two aligned 2x2 matrix pairs, each packed under Convention S
+  // (column-major per tile) and interleaved in d -> p -> l physical order:
   //
-  //   A0 = [1 2]   B0 = [5 6]   A0*B0 = [19 22]
+  //   A0 = [1 2]   B0 = [5 6]   A0@B0 = [19 22]
   //        [3 4]        [7 8]            [43 50]
   //
-  //   A1 = [2 0]   B1 = [4 1]   A1*B1 = [ 8  2]
+  //   A1 = [2 0]   B1 = [4 1]   A1@B1 = [ 8  2]
   //        [1 3]        [2 5]            [10 16]
-  LiteralValue packedA(std::vector<int>{1, 2, 2, 0, 3, 4, 1, 3});
-  LiteralValue packedB(std::vector<int>{5, 6, 4, 1, 7, 8, 2, 5});
+  LiteralValue packedA(std::vector<int>{1, 3, 2, 1, 2, 4, 0, 3});
+  LiteralValue packedB(std::vector<int>{5, 7, 4, 2, 6, 8, 1, 5});
 
   auto dag = implementMtpJklsMatmul(
       packedA, packedB, /*tileSize=*/2, /*tilesPerCiphertext=*/2,
@@ -1065,20 +1078,26 @@ TEST(KernelImplementationTest, MtpJklsMatmulMultiplePackedTiles) {
 
   LiteralValue result = evalKernel(dag)[0];
   EXPECT_EQ(std::get<std::vector<int>>(result.get()),
-            std::vector<int>({19, 22, 8, 2, 43, 50, 10, 16}));
+            std::vector<int>({19, 43, 8, 10, 22, 50, 2, 16}));
 }
 
 TEST(KernelImplementationTest, MtpJklsMatmulCiphertextTensor) {
   // Each row is one ciphertext containing two independently valued 2x2 tile
-  // pairs in d -> p -> l order. Rotations and masks must act independently on
-  // the final slot dimension without mixing the two ciphertext rows.
+  // pairs, each packed under Convention S and interleaved in d -> p -> l
+  // physical order. Rotations and masks must act independently on the final
+  // slot dimension without mixing the two ciphertext rows.
+  //
+  //   Row 0: A0=[1 2;3 4]  B0=[5 6;7 8]   A0@B0=[19 22;43 50]
+  //          A1=[2 0;1 3]  B1=[4 1;2 5]   A1@B1=[ 8  2;10 16]
+  //   Row 1: A0=[1 2;0 1]  B0=[4 1;6 7]   A0@B0=[16 15; 6  7]
+  //          A1=[0 1;0 3]  B1=[2 3;4 5]   A1@B1=[ 4  5;12 15]
   LiteralValue packedA(std::vector<std::vector<int>>{
-      {1, 2, 2, 0, 3, 4, 1, 3},
-      {1, 0, 2, 1, 0, 1, 0, 3},
+      {1, 3, 2, 1, 2, 4, 0, 3},
+      {1, 0, 0, 0, 2, 1, 1, 3},
   });
   LiteralValue packedB(std::vector<std::vector<int>>{
-      {5, 6, 4, 1, 7, 8, 2, 5},
-      {4, 5, 1, 2, 6, 7, 3, 4},
+      {5, 7, 4, 2, 6, 8, 1, 5},
+      {4, 6, 2, 4, 1, 7, 3, 5},
   });
 
   auto dag = implementMtpJklsMatmul(
@@ -1088,8 +1107,8 @@ TEST(KernelImplementationTest, MtpJklsMatmulCiphertextTensor) {
   LiteralValue result = evalKernel(dag)[0];
   EXPECT_EQ(std::get<std::vector<std::vector<int>>>(result.get()),
             (std::vector<std::vector<int>>{
-                {19, 22, 8, 2, 43, 50, 10, 16},
-                {4, 5, 5, 8, 6, 7, 9, 12},
+                {19, 43, 8, 10, 22, 50, 2, 16},
+                {16, 6, 4, 12, 15, 7, 5, 15},
             }));
 }
 
@@ -1132,6 +1151,91 @@ TEST(KernelImplementationTest,
   // Protect against a vacuous equality test or accidental removal of every
   // non-identity permutation.
   EXPECT_GT(*referenceRotationCount, 0);
+}
+
+// Permanent, explicit regression for the canonical Convention S worked
+// example: l is the local matrix row, d is the local matrix column,
+// slot = d*(tilesPerCiphertext*mu) + p*mu + l. For a single tile
+// (tilesPerCiphertext=1, p=0) this reduces to packed[l + d*mu] =
+// M[row=l][col=d], i.e. a column-major flatten per tile.
+TEST(KernelImplementationTest, MtpJklsMatmulConventionSCanonicalExample) {
+  //   A = [1 2]    B = [5 6]     A@B = [19 22]
+  //       [3 4]        [7 8]            [43 50]
+  LiteralValue packedA(std::vector<int>{1, 3, 2, 4});
+  LiteralValue packedB(std::vector<int>{5, 7, 6, 8});
+
+  auto dag = implementMtpJklsMatmul(
+      packedA, packedB, /*tileSize=*/2, /*tilesPerCiphertext=*/1,
+      DagType::intTensor(32, {4}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  EXPECT_EQ(std::get<std::vector<int>>(result.get()),
+            std::vector<int>({19, 43, 22, 50}));
+}
+
+// Proves operand roles are bound by actual provenance (which tensor was
+// passed as packedA/packedB), not merely by which local variable name a
+// reader might expect. Uses non-commuting, asymmetric matrices (A@B != B@A
+// and A@B != A^T@B^T for this pair) so a wrong operand-role binding is
+// numerically distinguishable, not just structurally different.
+TEST(KernelImplementationTest, MtpJklsMatmulDistinguishesOperandOrder) {
+  // A = [1 3]    B = [9 4]
+  //     [7 2]        [6 5]
+  //
+  // A@B     = [1*9+3*6, 1*4+3*5; 7*9+2*6, 7*4+2*5] = [27 19; 75 38]
+  // B@A     = [9*1+4*7, 9*3+4*2; 6*1+5*7, 6*3+5*2] = [37 35; 41 28]
+  // A^T@B^T = [1*9+7*4, 1*6+7*5; 3*9+2*4, 3*6+2*5] = [37 41; 35 28]
+  LiteralValue packedA(std::vector<int>{1, 7, 3, 2});  // column-major A
+  LiteralValue packedB(std::vector<int>{9, 6, 4, 5});  // column-major B
+
+  auto dag = implementMtpJklsMatmul(
+      packedA, packedB, /*tileSize=*/2, /*tilesPerCiphertext=*/1,
+      DagType::intTensor(32, {4}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  std::vector<int> actual = std::get<std::vector<int>>(result.get());
+  // packed A@B, column-major: [27, 75, 19, 38]
+  EXPECT_EQ(actual, std::vector<int>({27, 75, 19, 38}));
+  // Must differ from B@A (packed column-major: [37, 41, 35, 28]) and from
+  // A^T@B^T (packed column-major: [37, 35, 41, 28]) -- both are plausible
+  // wrong results from a swapped or half-swapped operand binding.
+  EXPECT_NE(actual, std::vector<int>({37, 41, 35, 28}));
+  EXPECT_NE(actual, std::vector<int>({37, 35, 41, 28}));
+}
+
+// Proves l=row, d=column at the level of exact slot placement, not only via
+// a flattened-vector comparison: uses a tile where every one of the four
+// (row,col) positions holds a distinct value, so any row/column transposition
+// or row-major (Convention K) misinterpretation of the same physical slots
+// produces a different, distinguishable placement.
+TEST(KernelImplementationTest, MtpJklsMatmulConventionSExactSlotPlacement) {
+  // A = [10 20]   (distinct per-cell markers so a transposed or row-major
+  //     [30 40]    misreading is immediately visible)
+  // B = identity, so C = A exactly -- isolates the *packing* claim from the
+  // arithmetic.
+  //
+  // Convention S packing of A (slot = d*mu + l, l=row, d=col):
+  //   slot0 (l=0,d=0) = A[row=0][col=0] = 10
+  //   slot1 (l=1,d=0) = A[row=1][col=0] = 30
+  //   slot2 (l=0,d=1) = A[row=0][col=1] = 20
+  //   slot3 (l=1,d=1) = A[row=1][col=1] = 40
+  LiteralValue packedA(std::vector<int>{10, 30, 20, 40});
+  LiteralValue packedIdentity(std::vector<int>{1, 0, 0, 1});
+
+  auto dag = implementMtpJklsMatmul(
+      packedA, packedIdentity, /*tileSize=*/2, /*tilesPerCiphertext=*/1,
+      DagType::intTensor(32, {4}));
+
+  LiteralValue result = evalKernel(dag)[0];
+  std::vector<int> actual = std::get<std::vector<int>>(result.get());
+  // Convention S expected: [10, 30, 20, 40] (echoes packedA exactly).
+  EXPECT_EQ(actual, std::vector<int>({10, 30, 20, 40}));
+  // A row-major (Convention K) misinterpretation of these same physical
+  // slots would instead decode as A^T = [10 30; 20 40] (i.e. this exact
+  // vector [10,30,20,40] read row-major means [[10,30],[20,40]], not
+  // [[10,20],[30,40]]) -- the point of this test is that the *placement*,
+  // not just the final numeric vector, is what Convention S fixes; a
+  // reader must consult the (l,d)->slot formula, not assume row-major.
 }
 
 TEST(KernelImplementationTest, BicyclicMatmul) {

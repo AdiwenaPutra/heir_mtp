@@ -1,4 +1,6 @@
-#mtp = #tensor_ext.layout<"{ [p, d, l] -> [ct, slot] : ct = 0 and slot - 4 * d - 2 * p - l = 0 and 0 <= p <= 1 and 0 <= d <= 1 and 0 <= l <= 1 and 0 <= slot <= 7 }">
+// Convention S: l (tensor axis 1) is the local matrix row, d (tensor axis 2)
+// is the local matrix column, slot = d*(tilesPerCiphertext*mu) + p*mu + l.
+#mtp = #tensor_ext.layout<"{ [p, l, d] -> [ct, slot] : ct = 0 and slot - 4 * d - 2 * p - l = 0 and 0 <= p <= 1 and 0 <= l <= 1 and 0 <= d <= 1 and 0 <= slot <= 7 }">
 #kernel = #secret.kernel<name = "BatchMatmulMtpJkls", force = true>
 
 module {

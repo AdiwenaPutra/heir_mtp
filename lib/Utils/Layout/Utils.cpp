@@ -1437,6 +1437,37 @@ presburger::IntegerRelation shiftVar(
   return *shiftedRelation;
 }
 
+FailureOr<int64_t> getRemapExtractionOffset(const IntegerRelation& relation,
+                                            int64_t resultRows,
+                                            int64_t resultCols,
+                                            int64_t carrierRows,
+                                            int64_t carrierCols) {
+  if (resultCols != carrierCols) {
+    return failure();
+  }
+
+  unsigned rangeCtVar = relation.getVarKindOffset(VarKind::Range);
+  std::optional<int64_t> lowerBound =
+      relation.getConstantBound64(BoundType::LB, rangeCtVar);
+  std::optional<int64_t> upperBound =
+      relation.getConstantBound64(BoundType::UB, rangeCtVar);
+  if (!lowerBound || !upperBound) {
+    return failure();
+  }
+
+  int64_t offset = lowerBound.value();
+  if (offset < 0) {
+    return failure();
+  }
+  if (resultRows != upperBound.value() - offset + 1) {
+    return failure();
+  }
+  if (offset + resultRows > carrierRows) {
+    return failure();
+  }
+  return offset;
+}
+
 presburger::IntegerRelation getPaddingRelation(RankedTensorType paddedType,
                                                RankedTensorType unpaddedType,
                                                ArrayRef<int64_t> lowPadding) {

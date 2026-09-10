@@ -22,6 +22,10 @@ using FuzzArgs =
 // Converts tile-major matrices [p][d][l] into the MTP physical order
 // d -> p -> l. Slots beyond the occupied prefix are filled with sentinels so
 // the test also verifies that the kernel clears excess ciphertext capacity.
+// This flat [p][d][l] layout is convention-agnostic on its own -- it simply
+// forwards whatever (d,l) a caller supplies into the shared physical slot
+// formula; see naiveTilewiseMatmul below for the Convention-S binding of
+// (row,col) to (l,d) that makes the comparison meaningful.
 std::vector<int> packMtp(const std::vector<int>& matrices, int64_t tileSize,
                          int64_t tilesPerCiphertext, int64_t excessSlots) {
   int64_t occupiedSlots = tileSize * tileSize * tilesPerCiphertext;
@@ -40,22 +44,33 @@ std::vector<int> packMtp(const std::vector<int>& matrices, int64_t tileSize,
   return packed;
 }
 
+// Convention S: l is the local matrix row, d is the local matrix column, so
+// matrices[p][d][l] (packMtp's own flat layout) holds M[row=l][col=d] --
+// i.e. matrixIndex(p, /*d=*/col, /*l=*/row) addresses M[row][col]. Computes
+// ordinary matrixA @ matrixB per tile under that binding (this is the same
+// closed-form product implementMtpJklsMatmul's swapped sigma/Phi(B),
+// tau/Psi(A) operand-role binding computes -- see that function's header
+// comment).
 std::vector<int> naiveTilewiseMatmul(const std::vector<int>& matricesA,
                                      const std::vector<int>& matricesB,
                                      int64_t tileSize,
                                      int64_t tilesPerCiphertext) {
   std::vector<int> result(tileSize * tileSize * tilesPerCiphertext, 0);
 
+  auto matrixIndex = [tileSize](int64_t p, int64_t d, int64_t l) {
+    return (p * tileSize + d) * tileSize + l;
+  };
+
   for (int64_t p = 0; p < tilesPerCiphertext; ++p) {
     for (int64_t row = 0; row < tileSize; ++row) {
       for (int64_t column = 0; column < tileSize; ++column) {
         int value = 0;
-        for (int64_t k = 0; k < tileSize; ++k) {
-          int64_t lhsIndex = (p * tileSize + row) * tileSize + k;
-          int64_t rhsIndex = (p * tileSize + k) * tileSize + column;
-          value += matricesA[lhsIndex] * matricesB[rhsIndex];
+        for (int64_t t = 0; t < tileSize; ++t) {
+          int aVal = matricesA[matrixIndex(p, /*d=*/t, /*l=*/row)];
+          int bVal = matricesB[matrixIndex(p, /*d=*/column, /*l=*/t)];
+          value += aVal * bVal;
         }
-        result[(p * tileSize + row) * tileSize + column] = value;
+        result[matrixIndex(p, /*d=*/column, /*l=*/row)] = value;
       }
     }
   }

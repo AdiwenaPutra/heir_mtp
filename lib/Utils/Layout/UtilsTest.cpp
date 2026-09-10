@@ -1253,6 +1253,116 @@ TEST(UtilsTest, TestShiftVarRangeOffset) {
   EXPECT_TRUE(shiftedRel.containsPointNoLocal({8, 1, 19}).has_value());
 }
 
+TEST(UtilsTest, GetRemapExtractionOffsetLowerBoundZero) {
+  MLIRContext context;
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : 0 <= d <= 7 and ct = 0 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/1,
+                                         /*resultCols=*/8, /*carrierRows=*/2,
+                                         /*carrierCols=*/8);
+  ASSERT_TRUE(succeeded(offset));
+  EXPECT_EQ(offset.value(), 0);
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetUsesRangeNotDomainBound) {
+  MLIRContext context;
+  // Domain lower bound (100) is deliberately far from the range (ct) lower
+  // bound (1) so that a mutant reading the domain-side bound instead of the
+  // range-side bound is caught by the exact value check below, not just by
+  // a failure/success distinction.
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : 100 <= d <= 107 and ct = 1 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/1,
+                                         /*resultCols=*/8, /*carrierRows=*/2,
+                                         /*carrierCols=*/8);
+  ASSERT_TRUE(succeeded(offset));
+  EXPECT_EQ(offset.value(), 1);
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetNonLeadingMultiRowSpan) {
+  MLIRContext context;
+  // ct spans the non-leading, multi-row interval [1, 2] within a 4-row
+  // carrier.
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : 0 <= d <= 7 and 1 <= ct <= 2 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/2,
+                                         /*resultCols=*/8, /*carrierRows=*/4,
+                                         /*carrierCols=*/8);
+  ASSERT_TRUE(succeeded(offset));
+  EXPECT_EQ(offset.value(), 1);
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetFailsWithoutConstantCtBound) {
+  MLIRContext context;
+  // ct is unconstrained, so it has no constant lower or upper bound.
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : d = 0 and 0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/1,
+                                         /*resultCols=*/8, /*carrierRows=*/2,
+                                         /*carrierCols=*/8);
+  EXPECT_TRUE(failed(offset));
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetFailsOnNegativeLowerBound) {
+  MLIRContext context;
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : d = 0 and -2 <= ct <= -1 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/2,
+                                         /*resultCols=*/8, /*carrierRows=*/4,
+                                         /*carrierCols=*/8);
+  EXPECT_TRUE(failed(offset));
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetRejectsUpperPlusOneInsteadOfSpan) {
+  MLIRContext context;
+  // ct spans [1, 2] (a span of upperBound - lowerBound + 1 = 2), so a
+  // mutant that instead validates against (upperBound + 1 = 3) would wrongly
+  // accept resultRows=3 here; the correct implementation must reject it.
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : 0 <= d <= 7 and 1 <= ct <= 2 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/3,
+                                         /*resultCols=*/8, /*carrierRows=*/4,
+                                         /*carrierCols=*/8);
+  EXPECT_TRUE(failed(offset));
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetFailsWhenSpanExceedsCarrier) {
+  MLIRContext context;
+  // ct spans [1, 2] (2 rows), but the carrier only has 2 physical rows, so
+  // offset(1) + resultRows(2) = 3 does not fit within carrierRows(2).
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : 0 <= d <= 7 and 1 <= ct <= 2 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/2,
+                                         /*resultCols=*/8, /*carrierRows=*/2,
+                                         /*carrierCols=*/8);
+  EXPECT_TRUE(failed(offset));
+}
+
+TEST(UtilsTest, GetRemapExtractionOffsetFailsOnSlotCountMismatch) {
+  MLIRContext context;
+  auto rel = getIntegerRelationFromIslStr(
+                 "{ [d] -> [ct, slot] : 0 <= d <= 7 and ct = 0 and "
+                 "0 <= slot <= 7 }")
+                 .value();
+  auto offset = getRemapExtractionOffset(rel, /*resultRows=*/1,
+                                         /*resultCols=*/4, /*carrierRows=*/2,
+                                         /*carrierCols=*/8);
+  EXPECT_TRUE(failed(offset));
+}
+
 TEST(UtilsTest, TestGetSliceExtractionRelation) {
   MLIRContext context;
   // Extract a 3x4 slice from a 2x1x3x4 matrix at (1, 0, 0, 0). Source dims 0

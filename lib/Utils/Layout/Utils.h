@@ -301,6 +301,33 @@ presburger::IntegerRelation shiftVar(
     const presburger::IntegerRelation& relation, unsigned int pos,
     int64_t offset);
 
+// Computes the physical ciphertext-row offset at which a `tensor_ext.remap`
+// result must be sliced to extract `resultRows` rows whose layout is
+// described by `relation`'s range side, out of a same-shape remap carrier of
+// `carrierRows` physical ciphertexts.
+//
+// The offset is the tight lower bound of `relation`'s range-side ciphertext
+// variable (never the domain-side bound: the domain and range of a layout
+// relation index physically distinct tensors -- the pre-remap source and the
+// post-remap carrier -- and only the range side describes where the wanted
+// rows land in the carrier this slice is cut from). `tensor.extract_slice`
+// then normalizes the physical carrier rows [offset, offset + resultRows - 1]
+// into result rows [0, resultRows - 1].
+//
+// Returns failure() without asserting if:
+//  - the relation has no constant range-side lower or upper bound;
+//  - the lower bound is negative;
+//  - resultRows does not equal (upperBound - lowerBound + 1), i.e. the
+//    caller-supplied result shape does not match the span the relation
+//    itself describes;
+//  - the extracted span [offset, offset + resultRows) does not fit within
+//    carrierRows;
+//  - resultCols does not equal carrierCols (a remap carrier and its slice
+//    must agree on slot count; only the ciphertext-row span narrows).
+FailureOr<int64_t> getRemapExtractionOffset(
+    const presburger::IntegerRelation& relation, int64_t resultRows,
+    int64_t resultCols, int64_t carrierRows, int64_t carrierCols);
+
 // Get layout relation that corresponds to a tensor::pad op.
 presburger::IntegerRelation getPaddingRelation(RankedTensorType paddedType,
                                                RankedTensorType unpaddedType,

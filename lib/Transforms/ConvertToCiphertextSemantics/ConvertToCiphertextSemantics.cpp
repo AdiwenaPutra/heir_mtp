@@ -139,20 +139,39 @@ IntegerRelation restrictRelationToSlice(const IntegerRelation& relation,
 // To bridge this gap, kernels must post-processes the remap's output to
 // extract the subset ciphertexts relevant to the layout of the output
 // slice.
-Operation* remapAndExtractResult(ImplicitLocOpBuilder& builder, Value input,
-                                 LayoutAttr resultLayout,
-                                 RankedTensorType resultType) {
+//
+// The wanted subset of physical ciphertext rows need not start at row 0 of
+// the remap carrier: `resultLayout`'s range-side ciphertext variable may
+// have a nonzero tight lower bound (e.g. when the wanted result is one
+// destination among several sharing one multi-ciphertext carrier). In that
+// case `tensor.extract_slice` normalizes physical carrier rows
+// [lowerBound, upperBound] into result rows [0, resultRows - 1]; see
+// getRemapExtractionOffset.
+FailureOr<Operation*> remapAndExtractResult(ImplicitLocOpBuilder& builder,
+                                            Value input,
+                                            LayoutAttr resultLayout,
+                                            RankedTensorType resultType) {
   assert(resultType.getRank() == 2 && "Expected 2D ciphertext semantic type");
   auto remapOp = tensor_ext::RemapOp::create(builder, input, resultLayout);
 
+  auto carrierType = cast<RankedTensorType>(remapOp.getResult().getType());
+  FailureOr<int64_t> ctOffset = getRemapExtractionOffset(
+      resultLayout.getIntegerRelation(), resultType.getDimSize(0),
+      resultType.getDimSize(1), carrierType.getDimSize(0),
+      carrierType.getDimSize(1));
+  if (failed(ctOffset)) {
+    return failure();
+  }
+
   SmallVector<OpFoldResult> strides(2, builder.getIndexAttr(1));
-  SmallVector<OpFoldResult> offsets(2, builder.getIndexAttr(0));
+  SmallVector<OpFoldResult> offsets = {builder.getIndexAttr(ctOffset.value()),
+                                       builder.getIndexAttr(0)};
   SmallVector<OpFoldResult> sizes;
   sizes.push_back(builder.getIndexAttr(resultType.getDimSize(0)));
   sizes.push_back(builder.getIndexAttr(resultType.getDimSize(1)));
   auto extractRemap = tensor::ExtractSliceOp::create(
       builder, resultType, remapOp.getResult(), offsets, sizes, strides);
-  return extractRemap;
+  return extractRemap.getOperation();
 }
 
 // Rebuilds the full periodic layout of a kernel's output from the valid prefix
@@ -570,11 +589,16 @@ class ConvertConvertLayout
         getTypeConverter()->convertType(op.getResult().getType(), toLayout));
     auto remapAndExtract = remapAndExtractResult(
         b, adaptor.getValue(), newLayoutAttr, resultCiphertextSemanticType);
+    if (failed(remapAndExtract)) {
+      return op.emitError()
+             << "failed to compute a valid ciphertext-row extraction offset "
+                "for this layout conversion's remap result";
+    }
 
-    setMaterializedAttr(remapAndExtract);
-    setAttributeAssociatedWith(remapAndExtract->getResults()[0],
+    setMaterializedAttr(remapAndExtract.value());
+    setAttributeAssociatedWith(remapAndExtract.value()->getResults()[0],
                                kLayoutAttrName, toLayout);
-    rewriter.replaceOp(op, remapAndExtract->getResults()[0]);
+    rewriter.replaceOp(op, remapAndExtract.value()->getResults()[0]);
     return success();
   };
 };
@@ -1884,11 +1908,16 @@ class ConvertTensorPad : public ContextAwareOpConversionPattern<tensor::PadOp> {
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
     auto remapAndExtract = remapAndExtractResult(
         b, adaptor.getSource(), remapLayoutAttr, resultCiphertextSemanticType);
+    if (failed(remapAndExtract)) {
+      return op.emitError()
+             << "failed to compute a valid ciphertext-row extraction offset "
+                "for this pad op's remap result";
+    }
 
-    setMaterializedAttr(remapAndExtract);
-    setAttributeAssociatedWith(remapAndExtract->getResult(0), kLayoutAttrName,
-                               resultLayout);
-    rewriter.replaceOp(op, remapAndExtract->getResult(0));
+    setMaterializedAttr(remapAndExtract.value());
+    setAttributeAssociatedWith(remapAndExtract.value()->getResult(0),
+                               kLayoutAttrName, resultLayout);
+    rewriter.replaceOp(op, remapAndExtract.value()->getResult(0));
     return success();
   }
 
@@ -2094,6 +2123,20 @@ class ConvertTensorInsertSlice
                                 ciphertextSemanticType.getElementType());
     auto numCt = ciphertextSemanticType.getDimSize(0);
     auto slots = ciphertextSemanticType.getDimSize(1);
+    RankedTensorType singleCiphertextType = RankedTensorType::get(
+        {1, slots}, ciphertextSemanticType.getElementType());
+    // convertedSource may itself genuinely span more than one physical
+    // ciphertext: when the inserted slice's own tile straddles a
+    // ciphertext boundary already present in the destination's layout
+    // (e.g. a mu x mu tile whose rows land in different ciphertexts
+    // because the destination's row-major flattening splits mid-row),
+    // materializeLayout correctly gives convertedSource a multi-row
+    // shape. Row r of convertedSource (0-indexed) corresponds to
+    // physical ciphertext (ctLowerBound + r), since shiftedSliceInsertionLayout
+    // (and, when no conversion was needed, scalarRel itself) is defined
+    // to start its own ct range at 0 there.
+    int64_t srcNumCt =
+        cast<RankedTensorType>(convertedSource.getType()).getDimSize(0);
     for (auto ct = 0; ct < numCt; ++ct) {
       Value scalarMask = results.first[ct];
       Value destMask = results.second[ct];
@@ -2108,10 +2151,41 @@ class ConvertTensorInsertSlice
       sizes.push_back(b.getIndexAttr(slots));
       SmallVector<OpFoldResult> strides(2, b.getIndexAttr(1));
       Operation* extractedDest = tensor::ExtractSliceOp::create(
-          b, op.getLoc(), cast<RankedTensorType>(convertedSource.getType()),
-          adaptor.getDest(), ctOffsets, sizes, strides);
+          b, op.getLoc(), singleCiphertextType, adaptor.getDest(), ctOffsets,
+          sizes, strides);
+
+      // Select the single [1, slots] row of convertedSource -- if any --
+      // that corresponds to this destination ciphertext, rather than
+      // assuming convertedSource is always already [1, slots].
+      int64_t srcRow = ct - ctLowerBound.value();
+      Value scalarOperand;
+      SmallVector<Operation*> materializedThisIter = {extractedDest};
+      if (srcRow >= 0 && srcRow < srcNumCt) {
+        if (srcNumCt == 1) {
+          scalarOperand = convertedSource;
+        } else {
+          SmallVector<OpFoldResult> srcOffsets;
+          srcOffsets.push_back(rewriter.getIndexAttr(srcRow));
+          srcOffsets.push_back(rewriter.getIndexAttr(0));
+          Operation* extractedSrcRow = tensor::ExtractSliceOp::create(
+              b, op.getLoc(), singleCiphertextType, convertedSource,
+              srcOffsets, sizes, strides);
+          scalarOperand = extractedSrcRow->getResult(0);
+          materializedThisIter.push_back(extractedSrcRow);
+        }
+      } else {
+        // This destination ciphertext receives no contribution from the
+        // source (its scalarMask is provably all-zero by construction of
+        // createMasksFromStaticIndicesAtCt); use a zero placeholder so the
+        // multiply's operand types match.
+        Operation* zeroOperand = arith::ConstantOp::create(
+            b, singleCiphertextType, b.getZeroAttr(singleCiphertextType));
+        scalarOperand = zeroOperand->getResult(0);
+        materializedThisIter.push_back(zeroOperand);
+      }
+
       Operation* scalarMul = makeAppropriatelyTypedMulOp(
-          b, op.getLoc(), scalarMask, convertedSource, {getArithFMF(b)});
+          b, op.getLoc(), scalarMask, scalarOperand, {getArithFMF(b)});
       Operation* destMul = makeAppropriatelyTypedMulOp(
           b, op.getLoc(), destMask, extractedDest->getResult(0),
           {getArithFMF(b)});
@@ -2122,8 +2196,8 @@ class ConvertTensorInsertSlice
       // Insert the final result into the ciphertext at position ct.
       Operation* insertOp = tensor::InsertSliceOp::create(
           b, finalAdd->getResult(0), result, ctOffsets, sizes, strides);
-      setMaterializedAttr(
-          {extractedDest, scalarMul, destMul, finalAdd, insertOp});
+      materializedThisIter.append({scalarMul, destMul, finalAdd, insertOp});
+      setMaterializedAttr(materializedThisIter);
       result = insertOp->getResult(0);
     }
 
@@ -2509,11 +2583,16 @@ class ConvertTensorExtractSlice
     ImplicitLocOpBuilder b(op.getLoc(), rewriter);
     auto remapAndExtract = remapAndExtractResult(
         b, adaptor.getSource(), sliceLayoutAttr, resultCiphertextSemanticType);
+    if (failed(remapAndExtract)) {
+      return op.emitError()
+             << "failed to compute a valid ciphertext-row extraction offset "
+                "for this extract_slice op's remap result";
+    }
 
-    setMaterializedAttr(remapAndExtract);
-    setAttributeAssociatedWith(remapAndExtract->getResult(0), kLayoutAttrName,
-                               resultLayout);
-    rewriter.replaceOp(op, remapAndExtract->getResult(0));
+    setMaterializedAttr(remapAndExtract.value());
+    setAttributeAssociatedWith(remapAndExtract.value()->getResult(0),
+                               kLayoutAttrName, resultLayout);
+    rewriter.replaceOp(op, remapAndExtract.value()->getResult(0));
     return success();
   }
 
@@ -3022,8 +3101,10 @@ struct ConvertLinalgBatchMatmul
         op->getAttr(kLayoutAttrName));
     auto hasExpectedMtpLayout = [&](RankedTensorType type,
                                     LayoutAttr layout) {
+      // Convention S: batch axis 1 is ordinary matrix row and maps to `l`;
+      // batch axis 2 is ordinary matrix column and maps to `d`.
       return layout && isRelationMultiTile(
-                           type, /*rowAxis=*/2, /*columnAxis=*/1,
+                           type, /*rowAxis=*/1, /*columnAxis=*/2,
                            /*tileRows=*/tileSize,
                            /*tileColumns=*/tileSize, tilesPerCiphertext,
                            numSlots, layout.getIntegerRelation());

@@ -495,12 +495,25 @@ implementMtpTranspose(const T& packed, int64_t tileRows,
 // Implements the JKLS ciphertext-ciphertext matrix multiplication on every
 // aligned square MTP tile pair:
 //
-//   C = sum_k Phi_k(sigma(A)) * Psi_k(tau(B)).
+//   C = sum_k Phi_k(sigma(B)) * Psi_k(tau(A)).
 //
-// Under the JKLS/MTP coordinate correspondence, d is the matrix row and l is
-// the matrix column. The returned slots therefore encode C = A * B in the same
-// d -> p -> l physical order. Relinearization and rescaling are intentionally
-// left to HEIR's scheme-management passes.
+// Under Convention S (the application-facing MTP contract used throughout
+// this project: l is the local matrix row, d is the local matrix column),
+// the abstract JKLS composition has closed form
+// kernel(P,Q)[l,d] = sum_t P[t,d] * Q[l,t]. Computing the ordinary product
+// C = A @ B therefore requires binding P = B (sigma, then every Phi_k) and
+// Q = A (tau, then every Psi_k) -- the reverse of a naive
+// sigma(A)/tau(B) pairing, which would instead compute B @ A. This is an
+// internal preprocessing-role swap only: the public operation remains
+// ordinary A @ B, and `implementMtpSigma`/`implementMtpTau`/
+// `implementMtpPhiOnDag`/`implementMtpPsiOnDag`'s own abstract (l,d)
+// definitions are unchanged -- only which packed operand is passed to which
+// helper changes here. (Historical note: an earlier revision of this
+// function bound sigma/Phi to A and tau/Psi to B instead. That binding is
+// internally self-consistent -- it computes B @ A rather than A @ B under
+// this same Convention S, not a transpose of either operand -- but does
+// not match the l=row/d=column contract stated above.) Relinearization and
+// rescaling are intentionally left to HEIR's scheme-management passes.
 template <typename T>
 std::enable_if_t<std::is_base_of<AbstractValue, T>::value,
                  std::shared_ptr<ArithmeticDagNode<T>>>
@@ -524,18 +537,21 @@ implementMtpJklsMatmul(const T& packedA, const T& packedB,
   assert(tilesPerCiphertext <= numSlots / slotsPerTile &&
          "MTP tiles do not fit in the available slots");
 
-  auto sigmaA = implementMtpSigma(packedA, tileSize, tileSize,
+  // Convention S operand-role binding (see function comment above): sigma
+  // and every Phi_k operate on packedB; tau and every Psi_k operate on
+  // packedA.
+  auto sigmaB = implementMtpSigma(packedB, tileSize, tileSize,
                                   tilesPerCiphertext, baseType);
-  auto tauB = implementMtpTau(packedB, tileSize, tileSize,
+  auto tauA = implementMtpTau(packedA, tileSize, tileSize,
                               tilesPerCiphertext, baseType);
 
-  auto result = NodeTy::mul(sigmaA, tauB);
+  auto result = NodeTy::mul(sigmaB, tauA);
   for (int64_t k = 1; k < tileSize; ++k) {
-    auto shiftedA = implementMtpPhiOnDag(
-        sigmaA, tileSize, tileSize, tilesPerCiphertext, k, baseType);
-    auto shiftedB = implementMtpPsiOnDag(
-        tauB, tileSize, tileSize, tilesPerCiphertext, k, baseType);
-    result = NodeTy::add(result, NodeTy::mul(shiftedA, shiftedB));
+    auto shiftedB = implementMtpPhiOnDag(
+        sigmaB, tileSize, tileSize, tilesPerCiphertext, k, baseType);
+    auto shiftedA = implementMtpPsiOnDag(
+        tauA, tileSize, tileSize, tilesPerCiphertext, k, baseType);
+    result = NodeTy::add(result, NodeTy::mul(shiftedB, shiftedA));
   }
 
   return result;

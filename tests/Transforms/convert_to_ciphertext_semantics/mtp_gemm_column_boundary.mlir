@@ -20,12 +20,22 @@
 // omits --mlir-print-local-scope, matching this directory's convention), so
 // these two CHECK-NOT lines deliberately have no other FileCheck directive
 // between them and their bounding match, covering both the alias preamble
-// and the function body without a gap.
-// CHECK-NOT: 1 = 0
+// and the function body without a gap. The plain-string form "1 = 0" (used
+// elsewhere in this directory) false-positives here: this fixture's
+// Convention-S boundary relations legitimately contain both "i1 = 0"
+// (a domain variable pinned to a single value at a size-1 boundary) and
+// "mod 31 = 0" (an ordinary modulus), both of which contain "1 = 0" as a
+// substring. The regex below requires a non-alphanumeric character
+// immediately before "1 = 0", which still matches a genuine standalone
+// always-false constraint (printed as "... : 1 = 0 ...", preceded by a
+// space or punctuation) while excluding both false positives.
+// CHECK-NOT: {{[^0-9A-Za-z]1 = 0}}
 // CHECK: func.func @mtp_gemm_column_boundary
-// CHECK-NOT: 1 = 0
+// CHECK-NOT: {{[^0-9A-Za-z]1 = 0}}
 
-#mtp4 = #tensor_ext.layout<"{ [p, d, l] -> [ct, slot] : ct = 0 and slot - 8*d - 2*p - l = 0 and 0 <= p <= 3 and 0 <= d <= 1 and 0 <= l <= 1 and 0 <= slot <= 15 }">
+// Convention S: l (tensor axis 1) is the local matrix row, d (tensor axis 2)
+// is the local matrix column, slot = d*(tilesPerCiphertext*mu) + p*mu + l.
+#mtp4 = #tensor_ext.layout<"{ [p, l, d] -> [ct, slot] : ct = 0 and slot - 8*d - 2*p - l = 0 and 0 <= p <= 3 and 0 <= d <= 1 and 0 <= l <= 1 and 0 <= slot <= 15 }">
 #rowmajorC = #tensor_ext.layout<"{ [i, j] -> [ct, slot] : ct = 0 and slot - 3*i - j = 0 and 0 <= i <= 3 and 0 <= j <= 2 and 0 <= slot <= 15 }">
 #tileRowMajor = #tensor_ext.layout<"{ [d, l] -> [ct, slot] : ct = 0 and slot - 2*d - l = 0 and 0 <= d <= 1 and 0 <= l <= 1 and 0 <= slot <= 15 }">
 #kernel = #secret.kernel<name = "BatchMatmulMtpJkls", force = true>

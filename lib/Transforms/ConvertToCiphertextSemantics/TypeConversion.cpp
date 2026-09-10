@@ -48,8 +48,30 @@ Type materializeLayout(Type dataType, LayoutAttr attr, int minSlotCount) {
                    << "materializeLayout: upper bound for range dimension "
                    << varPos - rangeOffset << " (ct) = " << *bounds.second
                    << "\n\n";);
-    ciphertextSemanticShape.push_back(int64_t(*bounds.second) +
-                                      1);  // +1 is because UB is inclusive
+    // The number of physical ciphertexts this dimension actually needs is
+    // the SPAN of its achievable range (upper - lower + 1), not simply
+    // upper + 1. Those coincide whenever the achievable range starts at 0
+    // (true for every "primary" layout constructed with an explicit
+    // `0 <= ct <= numCiphertexts - 1` bound, e.g. getMultiTileLayoutRelation
+    // and getRowMajorLayoutRelation), but a RESTRICTION of a larger
+    // multi-ciphertext layout -- e.g. composing a destination's own
+    // addressing with a fixed offset, as ConvertToCiphertextSemantics.cpp's
+    // secretScalarSecretTensor does when reconciling one sibling
+    // tensor.insert_slice among several into a shared multi-ciphertext
+    // destination -- can leave this dimension achievable ONLY at a single
+    // nonzero constant (lower == upper != 0). Using upper + 1 there
+    // silently over-allocates ciphertext-dimension rows the relation itself
+    // never populates (row 0 up to lower - 1), materializing a "padded"
+    // shape inconsistent with what any conversion that actually preserves
+    // physical shape (e.g. a same-ciphertext data permutation) produces.
+    // `bounds.first` (from the same computeIntegerBounds(coeffs) call
+    // above, coeffs selecting this exact dimension) is already this
+    // dimension's own tight lower bound, so no second solve is needed.
+    int64_t ciphertextsNeeded = int64_t(*bounds.second) + 1;
+    if (bounds.first.isBounded() && int64_t(*bounds.first) > 0) {
+      ciphertextsNeeded = int64_t(*bounds.second) - int64_t(*bounds.first) + 1;
+    }
+    ciphertextSemanticShape.push_back(ciphertextsNeeded);
   }
   // Last dimension is always the slot size. The relation may enforce a tighter
   // bound depending on whether the slots at the end are full, so use the upper

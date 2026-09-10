@@ -1465,8 +1465,10 @@ LogicalResult LayoutPropagation::visitOperation(BatchMatmulOp op) {
         getMtpJklsAutoSelectionParams(lhsType, rhsType, autoResultType,
                                       minSlotCount);
     if (succeeded(autoParams)) {
+      // Convention S: batch axis 1 is ordinary matrix row and maps to `l`;
+      // batch axis 2 is ordinary matrix column and maps to `d`.
       FailureOr<presburger::IntegerRelation> autoRelation =
-          getMultiTileLayoutRelation(lhsType, /*rowAxis=*/2, /*columnAxis=*/1,
+          getMultiTileLayoutRelation(lhsType, /*rowAxis=*/1, /*columnAxis=*/2,
                                      /*tileRows=*/autoParams->mu,
                                      /*tileColumns=*/autoParams->mu,
                                      autoParams->tilesPerCiphertext,
@@ -2220,8 +2222,43 @@ LayoutPropagation::getRequiredSliceLayoutForAuthoritativeDest(
     return failure();
   }
   IntegerRelation requiredSliceLayout = maybeInsertionRelation.value();
+  // Composes slice logical coordinates -> destination logical coordinates
+  // (via the insertion geometry) -> destination physical (ct, slot) (via
+  // destLayout itself).
   requiredSliceLayout.compose(destLayout.getIntegerRelation());
-  return requiredSliceLayout;
+
+  // The composed relation's range-side ct is expressed in the AUTHORITATIVE
+  // DESTINATION's own absolute numbering (e.g. ct == g for a slice landing
+  // in the destination's group g), since destLayout itself is never altered
+  // here (the destination keeps its absolute ct == 0, 1, ... addressing, as
+  // required). But the STANDALONE incoming source value being compared
+  // against this requirement -- e.g. a P8.5 group-local batch's own result,
+  // or any other freestanding tensor -- is never itself materialized with
+  // an absolute group offset baked into its own physical ciphertext index:
+  // a standalone tensor's ciphertext rows are always locally indexed from
+  // zero (this is the same convention tensor.extract_slice's own handling
+  // above, and ConvertTensorInsertSlice::secretScalarSecretTensor's own
+  // ctLowerBound/shiftVar reindexing, already rely on). Moving such a
+  // tensor's row 0 into destination row g is ordinary structural tensor
+  // assembly (which insertion offsets alone determine), not an FHE
+  // rotation -- it requires no encrypted operation and so must not be
+  // represented as one.
+  //
+  // So this requirement must likewise be re-expressed in that same
+  // zero-based convention before it can be compared against (or used to
+  // convert) a standalone source: shift the range-side ct variable down by
+  // its own tight lower bound, exactly as tensor.extract_slice's handling
+  // above does for its own result's layout. The destination relation
+  // (destLayout) itself is untouched by this -- only the computed
+  // REQUIREMENT on the incoming standalone source is renormalized.
+  unsigned ctVarOffset =
+      requiredSliceLayout.getVarKindOffset(presburger::VarKind::Range);
+  std::optional<int64_t> ctLowerBound = requiredSliceLayout.getConstantBound64(
+      presburger::BoundType::LB, ctVarOffset);
+  if (!ctLowerBound) {
+    return failure();
+  }
+  return shiftVar(requiredSliceLayout, ctVarOffset, -ctLowerBound.value());
 }
 
 CompatibilityResult LayoutPropagation::hasCompatibleArgumentLayouts(
